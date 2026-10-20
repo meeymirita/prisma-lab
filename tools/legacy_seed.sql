@@ -123,14 +123,15 @@ ORDER BY g;
 
 -- ───────────── вспомогательная таблица броней (удаляется в конце) ─────────────
 -- Предмет i получает свои брони подряд по слотам k = 0..74 по 18 дней; длительность ≤ 7 дней, сдвиг ≤ 9 дней → пересечений нет.
+-- Исключение: каждая 1999-я бронь (g % 1999 = 7) сдвигается в слот предыдущей брони того же предмета и пересекается с ней (период 1999 взаимно прост с 4000, поэтому у сдвинутой брони предшественник не сдвинут).
 CREATE TABLE _bk AS
 SELECT
     g,
     CASE WHEN g % 200 = 0 THEN 60000 + g ELSE 1 + ((g::bigint * 31) % 60000)::int END AS cust_id,        -- сироты: клиента нет
     CASE WHEN g % 333 = 0 THEN 4000 + g ELSE it END AS item_id,                                            -- сироты: предмета нет
     CASE WHEN g % 97 = 11 THEN 1 + ((it + 5) % 12) ELSE 1 + (it % 12) END AS branch_id,                    -- ~1 % с «чужим» филиалом
-    (date '2023-01-01' + ((CASE WHEN g % 2000 = 7 AND k > 0 THEN k - 1 ELSE k END) * 18 + (g % 10)))::date AS d_from,
-    ((date '2023-01-01' + ((CASE WHEN g % 2000 = 7 AND k > 0 THEN k - 1 ELSE k END) * 18 + (g % 10)))
+    (date '2023-01-01' + ((CASE WHEN g % 1999 = 7 AND k > 0 THEN k - 1 ELSE k END) * 18 + (g % 10)))::date AS d_from,
+    ((date '2023-01-01' + ((CASE WHEN g % 1999 = 7 AND k > 0 THEN k - 1 ELSE k END) * 18 + (g % 10)))
         + (g % 7))::date AS d_to,                                                                          -- d_to — день возврата (включительно)
     round(((ARRAY[900,1100,700,600,300,200,350,400])[1 + it % 8] * (1 + (it % 5) * 0.1)) * (1 + (g % 7)))::numeric AS total,
     CASE
@@ -250,4 +251,4 @@ ANALYZE;
 
 -- Контрольные числа для сверки после генерации (заполнить при прогоне, пока — ожидание):
 --   tbl_Branches 12, tbl_Items 4000, tbl_Customers 60000, tbl_Bookings 300000,
---   tbl_Payments ≈ 570 000, tbl_DepositLog ≈ 200 000.
+--   tbl_Payments = 583 035, tbl_DepositLog = 180 084 (проверено 20.10.2026: прогон на PostgreSQL 18).
