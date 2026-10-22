@@ -41,8 +41,14 @@ SQL
 
 Ожидаем порядка **полутораста пар**: в каждой — один и тот же предмет, выданный (или забронированный) двум клиентам на пересекающиеся даты. Это не «ошибка в коде», а реальный инцидент: кому-то пришлось отказать. Нужно принять **деловое решение** по каждой паре; для упражнения примем простое правило: **более позднюю по номеру бронь снимаем** (переводим в `CANCELLED`) и фиксируем в журнале, чтобы менеджеры связались с клиентами.
 
-```sql
--- prisma/migrations/20261022100000_resolve_overlaps/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name resolve_overlaps`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name resolve_overlaps && sleep 1
+```
+
+```sql into=prisma/migrations/*_resolve_overlaps/migration.sql
+-- prisma/migrations/<метка>_resolve_overlaps/migration.sql
 CREATE TABLE "overlap_fix_log" (
     "booking_id"    INTEGER PRIMARY KEY,
     "kept_booking"  INTEGER NOT NULL,
@@ -62,7 +68,18 @@ UPDATE "tbl_Bookings" SET status = 'CANCELLED', note = coalesce(note || '; ', ''
 WHERE id IN (SELECT booking_id FROM "overlap_fix_log");
 ```
 
-Добавь модель журнала в схему (`OverlapFixLog`), создай и применить миграцию, и проверь, что пересечений не осталось:
+Добавь модель журнала в схему (`OverlapFixLog`), примени миграцию и проверь, что пересечений не осталось:
+
+```prisma schema
+model OverlapFixLog {
+  bookingId   Int           @id @map("booking_id")
+  keptBooking Int           @map("kept_booking")
+  oldStatus   BookingStatus @map("old_status")
+  fixedAt     DateTime      @default(now()) @map("fixed_at") @db.Timestamptz(3)
+
+  @@map("overlap_fix_log")
+}
+```
 
 ```bash run
 cd ~/prisma-lab/rentkit
@@ -175,8 +192,14 @@ npx tsx src/lessons/13-naive.ts
 
 Нужны: расширение `btree_gist` (чтобы сравнивать обычное `=` и диапазонное `&&` в одном индексе) и колонка-диапазон. Делаем её **генерируемой** — база сама строит диапазон из `starts_at`/`ends_at`:
 
-```sql
--- prisma/migrations/20261022110000_booking_no_overlap/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name booking_no_overlap`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name booking_no_overlap && sleep 1
+```
+
+```sql into=prisma/migrations/*_booking_no_overlap/migration.sql
+-- prisma/migrations/<метка>_booking_no_overlap/migration.sql
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
 ALTER TABLE "tbl_Bookings"
@@ -191,19 +214,22 @@ ALTER TABLE "tbl_Bookings"
 
 Условие `WHERE (…)` делает ограничение **частичным**: отменённые, «не пришёл» и черновики предмет не занимают. В схеме Prisma диапазон описывается как `Unsupported` (клиент его не понимает, но **знает, что колонка существует**), и обязательно **необязательным** (`?`) — иначе клиент не сможет создавать брони:
 
-```prisma
+```prisma schema
 model Booking {
-  // …
-  period Unsupported("tstzrange")?
-  // …
+  // …поля как раньше…
+  period Unsupported("tstzrange")? @default(dbgenerated())
 }
 ```
+
+`@default(dbgenerated())` здесь обязателен — по той же причине, что у `phoneNorm` в 11.4: без него Prisma считает, что у колонки есть «лишнее значение по умолчанию», и в черновик каждой следующей миграции дописывает `ALTER COLUMN "period" DROP DEFAULT` — а PostgreSQL на генерируемой колонке отвечает ошибкой, и миграция падает на shadow-базе (проверено: именно так упала бы миграция `ledger` в шаге 14.2).
 
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate deploy
-npx prisma generate
+npm run generate
 npx prisma migrate dev --create-only --name should_be_empty_exclude
+cat prisma/migrations/*_should_be_empty_exclude/migration.sql
+rm -r prisma/migrations/*_should_be_empty_exclude
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr "SELECT conname, contype FROM pg_constraint WHERE conname = 'bookings_no_overlap'"
 npx tsx src/lessons/13-naive.ts
@@ -213,7 +239,7 @@ npx tsx src/lessons/13-naive.ts
 ```out auto
 ```
 
-Ожидаем: миграция применилась (если упала — значит, остались пересечения, шаг 13.1); `migrate dev --create-only` сообщает «Already in sync» (**сверьтесь**: Prisma не должна пытаться удалить `EXCLUDE` и генерируемую колонку; если пытается — не применяй миграцию); **вместо числа > 1 теперь ровно 1 успешная бронь**, остальные упали с нарушением ограничения (мы ещё не умеем красиво его ловить — это шаг 13.4).
+Ожидаем: миграция применилась (если упала — значит, остались пересечения, шаг 13.1); черновик `should_be_empty_exclude` пуст (`-- This is an empty migration.`: Prisma не пытается удалить `EXCLUDE` и генерируемую колонку; если внутри `DROP` — не применяй, удали папку); **вместо числа > 1 теперь ровно 1 успешная бронь**, остальные упали с нарушением ограничения (мы ещё не умеем красиво его ловить — это шаг 13.4).
 
 ### why
 Гонку закрыла **база**, а не код: проверка выполняется атомарно внутри команды `INSERT`, а индекс GiST делает её быстрой. Это тот самый выход за пределы схемы Prisma, о котором мы говорили в 8.5: часть ограничений ORM не описывает, но уважает. Правило: **если инвариант можно выразить ограничением, ограничение лучше проверки в коде.**
@@ -275,9 +301,9 @@ npx tsx src/lessons/13-error.ts
 ```out auto
 ```
 
-Посмотри на вывод и ответь себе: какой класс, какой `code`, где в `meta`/`message` встречается имя `bookings_no_overlap` или код `23P01`. Это **зависит от версии**: Prisma могла обернуть ошибку как «неизвестную» (`PrismaClientUnknownRequestError`) либо как `PrismaClientKnownRequestError` с кодом (например, `P2010` для raw-запросов). Надёжный способ — опираться на **имя ограничения**, которое всегда присутствует в тексте или в данных об ошибке базы. Напиши функцию определения и доменную ошибку:
+Посмотри на вывод и ответь себе: какой класс, какой `code`, где в `meta`/`message` встречается имя `bookings_no_overlap` или код `23P01`. Это **зависит от версии**. У нас (Prisma 7.10, адаптер `pg`) пришёл `PrismaClientKnownRequestError` с кодом **`P2039`** («Database error»), а настоящий код PostgreSQL и имя ограничения лежат глубже: в `meta.driverAdapterError.cause` (`originalCode: '23P01'`, `message: 'conflicting key value violates exclusion constraint "bookings_no_overlap"'`), и дублируются в тексте `message`. В другой версии класс и код могут быть иными (`PrismaClientUnknownRequestError`, `P2010` для raw-запросов), поэтому надёжный способ — опираться на **имя ограничения**, которое всегда присутствует в тексте или в данных об ошибке базы. Напиши функцию определения и доменную ошибку:
 
-```ts
+```ts append=src/lib/errors.ts
 // src/lib/errors.ts — дополнить
 export class ItemBusyError extends Error {
   constructor(public itemId: number) { super(`Предмет ${itemId} занят на эти даты`) }
@@ -432,7 +458,7 @@ LIMIT 20
 ```ts
 // src/data/availability.ts
 import { prisma } from '../db.js'
-import { freeItems } from '../generated/prisma/sql/index.js'
+import { freeItems } from '../generated/prisma/sql.js'
 import { branchRange } from '../lib/branch-day.js'
 
 export async function findFree(branchId: number, category: string, from: string, to: string) {
@@ -448,7 +474,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npx prisma generate --sql
+npm run generate
 npx tsx src/data/availability.ts
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr "EXPLAIN (ANALYZE) SELECT i.id FROM \"tbl_Items\" i WHERE i.branch_id = 5 AND i.category = 'Лыжи' AND NOT EXISTS (SELECT 1 FROM \"tbl_Bookings\" b WHERE b.item_id = i.id AND b.status IN ('CONFIRMED','ISSUED') AND b.period && tstzrange(now(), now() + interval '3 days', '[)'))"

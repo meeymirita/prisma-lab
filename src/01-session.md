@@ -190,7 +190,7 @@ npx prisma --version
 
 В выводе `prisma --version` в строках `prisma` и `@prisma/client` должна стоять **`7.x.x`**. Если там `8.x` — вы поставили не то: см. «Если не получилось». Файл `tsconfig.json`:
 
-```json
+```json file=tsconfig.json
 {
   "compilerOptions": {
     "target": "ES2023",
@@ -208,7 +208,7 @@ npx prisma --version
 
 Файл `.env` (в Git **не коммитим**: добавь в `.gitignore` строки `.env`, `node_modules`, `dist`, `src/generated`):
 
-```bash
+```bash file=.env
 DATABASE_URL="postgresql://postgres:postgres@localhost:5433/rental"
 ```
 
@@ -222,7 +222,7 @@ DATABASE_URL="postgresql://postgres:postgres@localhost:5433/rental"
   "dependencies": {
     "@prisma/adapter-pg": "7.x.x",
     "@prisma/client": "7.x.x",
-    "dotenv": "^17.0.0",
+    "dotenv": "^18.0.0",
     "pg": "^8.0.0"
   },
   "devDependencies": {
@@ -231,6 +231,10 @@ DATABASE_URL="postgresql://postgres:postgres@localhost:5433/rental"
     "typescript": "~6.0.0"
   }
 }
+```
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npm pkg set scripts.dev=tsx scripts.typecheck="tsc --noEmit"
 ```
 
 ### why

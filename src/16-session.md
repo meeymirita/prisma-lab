@@ -48,7 +48,7 @@ dur: ~4 ч
 
 ```bash run
 cd ~/prisma-lab/rentkit
-export APP_PW='замени-на-свой-пароль'
+export APP_PW='rental-app-pw'
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
 psqlr -v pw="$APP_PW" <<'SQL'
 DO $$ BEGIN
@@ -67,8 +67,14 @@ echo "роль создана"
 
 Права — **миграцией** (она хранится в Git и повторяется на каждом стенде; защитная проверка не даёт ей упасть там, где роли нет):
 
-```sql
--- prisma/migrations/20261024100000_app_role_grants/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name app_role_grants`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name app_role_grants && sleep 1
+```
+
+```sql into=prisma/migrations/*_app_role_grants/migration.sql
+-- prisma/migrations/<метка>_app_role_grants/migration.sql
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rental_app') THEN
@@ -80,8 +86,10 @@ BEGIN
   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO rental_app;
   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rental_app;
 
-  -- служебная таблица Prisma Migrate приложению не нужна
-  REVOKE ALL ON "_prisma_migrations" FROM rental_app;
+  -- служебная таблица Prisma Migrate приложению не нужна (на shadow-базе, где история проигрывается с нуля, её ещё нет — отсюда проверка)
+  IF to_regclass('public."_prisma_migrations"') IS NOT NULL THEN
+    REVOKE ALL ON "_prisma_migrations" FROM rental_app;
+  END IF;
 
   -- журналы только дописываются: ни правки, ни удаления
   REVOKE UPDATE, DELETE ON "audit_log", "ledger_entry", "orphan_log", "overlap_fix_log" FROM rental_app;
@@ -97,7 +105,7 @@ END $$;
 ```bash
 # .env
 DATABASE_URL="postgresql://postgres:postgres@localhost:5433/rental"                  # CLI и миграции (владелец)
-APP_DATABASE_URL="postgresql://rental_app:замени-на-свой-пароль@localhost:5433/rental" # приложение
+APP_DATABASE_URL="postgresql://rental_app:rental-app-pw@localhost:5433/rental" # приложение
 ```
 
 ```ts
@@ -105,11 +113,15 @@ APP_DATABASE_URL="postgresql://rental_app:замени-на-свой-парол�
 const adapter = new PrismaPg({ connectionString: process.env.APP_DATABASE_URL ?? process.env.DATABASE_URL! })
 ```
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && sed -i 's|connectionString: process.env.DATABASE_URL!|connectionString: process.env.APP_DATABASE_URL ?? process.env.DATABASE_URL!|' src/db.ts
+```
+
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate deploy
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
-psqlr -c "SELECT has_table_privilege('rental_app', 'tbl_Bookings', 'SELECT') AS читает_брони, has_table_privilege('rental_app', 'ledger_entry', 'DELETE') AS стирает_проводки, has_schema_privilege('rental_app', 'public', 'CREATE') AS создаёт_таблицы"
+psqlr -c "SELECT has_table_privilege('rental_app', '\"tbl_Bookings\"', 'SELECT') AS читает_брони, has_table_privilege('rental_app', 'ledger_entry', 'DELETE') AS стирает_проводки, has_schema_privilege('rental_app', 'public', 'CREATE') AS создаёт_таблицы"
 cat > src/lessons/16-role.ts <<'EOF'
 import { prisma } from '../db.js'
 console.log('кто я:', (await prisma.$queryRaw<{ u: string }[]>`SELECT current_user AS u`)[0]!.u)
@@ -152,8 +164,14 @@ npx tsx src/lessons/16-role.ts
 RLS — это «умные очки», которые база надевает на каждый запрос: сквозь них видны только **свои** строки. Очки настраиваются политикой: «показывай строки, у которых `branch_id` равен тому филиалу, который назван в этой сессии». Если филиал не назван — не показывай **ничего** (безопасный умолчательный ответ, а не «всё подряд»).
 :::
 
-```sql
--- prisma/migrations/20261024110000_rls_branch/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name rls_branch`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name rls_branch && sleep 1
+```
+
+```sql into=prisma/migrations/*_rls_branch/migration.sql
+-- prisma/migrations/<метка>_rls_branch/migration.sql
 
 -- идентификатор филиала приложение ставит в параметр сессии app.branch_id; пусто/не задан → NULL → строки не видны
 CREATE FUNCTION app_branch() RETURNS integer LANGUAGE sql STABLE AS
@@ -186,7 +204,7 @@ CREATE POLICY branch_isolation ON "tbl_Customers"
 cd ~/prisma-lab/rentkit
 npx prisma migrate deploy
 psqlr() { docker exec -i rental-pg psql -U rental_app -d rental "$@"; }
-export PGPASSWORD='замени-на-свой-пароль'
+export PGPASSWORD='rental-app-pw'
 docker exec -e PGPASSWORD="$PGPASSWORD" -i rental-pg psql -U rental_app -h 127.0.0.1 -d rental <<'SQL'
 SELECT count(*) AS без_филиала FROM "tbl_Bookings";
 BEGIN; SELECT set_config('app.branch_id', '3', true);
@@ -273,7 +291,7 @@ console.log('без филиала:', await prisma.booking.count())
 console.log('филиал 3   :', await b3.booking.count(), '| филиал 7:', await b7.booking.count(), '| админ:', await admin.booking.count())
 
 // запись в чужой филиал блокируется WITH CHECK
-await b3.booking.create({ data: { itemId: 1, branchId: 7, status: 'DRAFT' } })
+await b3.booking.create({ data: { itemId: 1, branchId: 7, status: 'DRAFT', startsAt: new Date('2062-01-01'), endsAt: new Date('2062-01-02') } })
   .catch((e) => console.log('чужой филиал →', String(e.message).split('\n').filter(Boolean).pop()))
 await prisma.$disconnect()
 ```
@@ -333,6 +351,7 @@ GRANT SELECT ("id", "CustName", "branch_id", "created_at") ON "tbl_Customers" TO
 GRANT SELECT ON "tbl_Bookings" TO rental_report;
 SQL
 docker exec -e PGPASSWORD=report-demo -i rental-pg psql -U rental_report -h 127.0.0.1 -d rental <<'SQL'
+SELECT set_config('app.role', 'admin', false) AS роль;      -- иначе RLS (16.3) скроет и строки таблицы, а не только колонки
 SELECT id, "CustName" FROM "tbl_Customers" LIMIT 1;
 SELECT phone FROM "tbl_Customers" LIMIT 1;
 SQL
@@ -412,7 +431,7 @@ check('A не удалит бронь B', (await A.booking.deleteMany({ where: {
 
 // — запись в чужой филиал
 let denied = false
-try { await A.booking.create({ data: { itemId: 1, branchId: 7, status: 'DRAFT' } }) } catch { denied = true }
+try { await A.booking.create({ data: { itemId: 1, branchId: 7, status: 'DRAFT', startsAt: new Date('2062-01-01'), endsAt: new Date('2062-01-02') } }) } catch { denied = true }
 check('A не создаст бронь в филиале B', denied)
 
 // — raw-запрос тоже под RLS (а вот переопределить параметр — может!)
@@ -475,6 +494,7 @@ npx tsx src/lessons/16-isolation-test.ts
 
 ```ts
 // src/lessons/16-leak.ts
+import 'dotenv/config'                             // этот скрипт не импортирует db.ts, поэтому .env читаем сами
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 

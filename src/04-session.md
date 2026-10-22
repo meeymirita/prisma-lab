@@ -244,7 +244,7 @@ export type BookingStatus = (typeof BookingStatus)[keyof typeof BookingStatus]
 
 Заменяем модели целиком на версию с нормальными именами (формат: `camelCase` в коде, `@map("старое_имя")` для колонок). Имена «…Text» — намеренное напоминание о проблеме:
 
-```prisma
+```prisma schema
 model Branch {
   id   Int     @id @default(autoincrement())
   name String? @db.VarChar(100)
@@ -327,18 +327,20 @@ npx prisma generate
 ```out auto
 ```
 
-**Ничего не поменялось в базе**: `@map` на поле — только соответствие в Prisma. Чтобы убедиться, попроси Prisma сравнить схему с базой (**сверьтесь**: точный текст сообщения):
+**Ничего не поменялось в базе**: `@map` на поле — только соответствие в Prisma. Чтобы убедиться, попроси Prisma сравнить схему с базой: `migrate dev --create-only` создаёт файл миграции **без применения**. Если расхождений нет, файл будет пустым:
 
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --create-only --name should_be_empty
+cat prisma/migrations/*_should_be_empty/migration.sql
+rm -r prisma/migrations/*_should_be_empty
 ```
 
 ### result
 ```out auto
 ```
 
-Ожидаем: «Already in sync, no schema change or pending migration was found» — миграция **не создана**. Если создалась — в схеме есть изменение, затрагивающее базу (проверь, не потерялся ли `@db.SmallInt` или `@map`): удали созданную папку и найди расхождение.
+Ожидаем: Prisma сообщает, что создала миграцию без применения, а внутри — одна строка `-- This is an empty migration.` (Prisma 7 создаёт файл **всегда**, даже когда менять нечего; сообщения «Already in sync» у `--create-only` нет). Пустой файл — признак того, что схема и база совпадают; мы его сразу удалили (`rm -r`). Если внутри есть `ALTER`/`CREATE` — в схеме есть изменение, затрагивающее базу (проверь, не потерялся ли `@db.SmallInt` или `@map`): найди расхождение, а папку удали.
 
 ### why
 Имя, которое ты видишь тысячу раз в день, определяет, как ты думаешь о данных. `startText` сразу говорит: «тут строка, осторожно»; `startsAt` обманул бы. Одновременно мы не трогаем базу: старый код и старые отчёты по-прежнему видят свои колонки.
@@ -347,7 +349,7 @@ npx prisma migrate dev --create-only --name should_be_empty
 Соглашение «имена в коде — `camelCase`, в базе — `snake_case`» принято в ТS-мире. Prisma не делает это автоматически: нужно `@map` у каждого поля (или инструмент, который расставит их по всей схеме). У нас имена в базе разнородные — поэтому расставляем вручную.
 
 ### deep Если не получилось
-- **`migrate dev` создал непустую миграцию** — в схеме поменялся тип или `@db.*`-атрибут. Сравни с выводом `db pull --print` и приведи в соответствие.
+- **В `migration.sql` не пусто (`ALTER`, `CREATE`)** — в схеме поменялся тип или `@db.*`-атрибут. Сравни с выводом `db pull --print` и приведи в соответствие.
 - **`migrate dev` просит сбросить базу** — **не соглашайся** (`n`): это drift; разберём в 11.5, а сейчас вернись к предыдущему рабочему состоянию схемы.
 
 ### quiz
@@ -456,12 +458,16 @@ npm run typecheck
 
 Сломаем: переименуй в `schema.prisma` поле `startText` модели `Booking` в `startRaw` (руками, в редакторе: остальное в строке — `@map("d_from")` — не трогай) и **не запускай** `generate`.
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && sed -i '/@map("d_from")/s/startText/startRaw/' prisma/schema.prisma
+```
+
 ```bash run
 cd ~/prisma-lab/rentkit
 grep -n 'd_from' prisma/schema.prisma
 cat > src/intro/10-stale.ts <<'EOF'
 import { prisma } from '../db.js'
-const b = await prisma.booking.findFirst({ select: { id: true, startRaw: true } })
+const b = await prisma.booking.findFirst({ where: { startRaw: { not: null } }, select: { id: true } })
 console.log(b)
 await prisma.$disconnect()
 EOF
@@ -472,7 +478,7 @@ npm run typecheck 2>&1 | head -6
 ```out auto
 ```
 
-Ожидаем ошибку компиляции вида `Object literal may only specify known properties, and 'startRaw' does not exist in type 'BookingSelect'` — клиент помнит `startText`. Запуск через `tsx` (он не проверяет типы!) упал бы уже в работе: `Unknown field startRaw`. Чиним:
+Ожидаем ошибку компиляции вида `Object literal may only specify known properties, and 'startRaw' does not exist in type 'BookingWhereInput'` — клиент помнит `startText`. Запуск через `tsx` (он не проверяет типы!) упал бы уже в работе: `Unknown argument startRaw`. **Неприятная деталь:** ошибись мы именем не в `where`, а в `select` (`select: { startRaw: true }`), `tsc` ошибку **не показал бы** — лишние поля в `select` TypeScript пропускает, и узнаёшь о них только при запуске (`Unknown field`). Поэтому после правки схемы всегда `generate`, а в тестах (сессия 18) гоняй запросы по-настоящему. Чиним:
 
 ```bash run
 cd ~/prisma-lab/rentkit
@@ -485,9 +491,13 @@ npx tsx src/intro/10-stale.ts
 ```out auto
 ```
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && sed -i '/@map("d_from")/s/startRaw/startText/' prisma/schema.prisma && npx prisma generate && rm src/intro/10-stale.ts
+```
+
 Верни прежнее имя (`startText`) и снова запусти `generate`, чтобы дальше работать с сохранённой схемой. **Как не забывать:** (1) добавь в `package.json` скрипт `"postinstall": "prisma generate"` — клиент пересоберётся после `npm install`; (2) добавь `"typecheck": "prisma generate && tsc --noEmit"`; (3) в CI (сессия 18) `generate` — отдельный обязательный шаг. В Prisma 7 после `migrate dev` **`generate` не запускается сам** — это важное отличие от старых версий.
 
-**Приёмка сессии:** схема с нормальными именами и `@map`, `migrate dev --create-only` сообщает, что база и схема в синхроне, клиент генерируется, `npx tsx src/intro/09-smoke.ts` печатает ожидаемые числа, а расшифровка статусов лежит в `src/domain/status.ts`.
+**Приёмка сессии:** схема с нормальными именами и `@map`, `migrate dev --create-only` создаёт пустую миграцию (база и схема совпадают; папку удалила), клиент генерируется, `npx tsx src/intro/09-smoke.ts` печатает ожидаемые числа, а расшифровка статусов лежит в `src/domain/status.ts`.
 
 ### why
 «У меня правильный код, а редактор ругается» — в 9 из 10 случаев забыт `generate`. Привычка: поменяла схему — запусти генерацию, потом открывай редактор. В Prisma 7 это особенно важно, потому что автоматического запуска нет.

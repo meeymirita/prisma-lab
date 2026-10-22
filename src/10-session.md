@@ -64,7 +64,7 @@ Prisma умеет сравнивать схему с базой, но не ум�
 
 Чтобы не рисковать настоящими таблицами, потренируемся на «песочнице»: заведём в схеме временную модель.
 
-```prisma
+```prisma schema
 model Scratch {
   id      Int     @id @default(autoincrement())
   oldName String? @map("old_name")
@@ -85,6 +85,10 @@ psqlr -c 'SELECT * FROM "Scratch" ORDER BY id'
 
 Теперь «переименуем» поле: в схеме `oldName String? @map("old_name")` → `newName String? @map("new_name")`. И попросим Prisma составить миграцию, **не применяя** её:
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && sed -i 's/oldName\( *\)String? @map("old_name")/newName\1String? @map("new_name")/' prisma/schema.prisma
+```
+
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --create-only --name scratch_rename
@@ -104,7 +108,7 @@ ADD COLUMN     "new_name" TEXT;
 
 Это **удаление данных**. Исправь файл вручную на настоящее переименование и только потом применяй:
 
-```sql
+```sql into=prisma/migrations/*_scratch_rename/migration.sql
 -- prisma/migrations/…_scratch_rename/migration.sql
 ALTER TABLE "Scratch" RENAME COLUMN "old_name" TO "new_name";
 ```
@@ -154,7 +158,7 @@ psqlr -c 'SELECT * FROM "Scratch" ORDER BY id'
 
 **Шаг 1 — «расширяем» схему.** Добавь в модели **новые** поля (старые не трогай!):
 
-```prisma
+```prisma schema
 enum BookingStatus {
   DRAFT
   CONFIRMED
@@ -207,7 +211,7 @@ cat prisma/migrations/*_expand_clean_columns/migration.sql
 
 В миграции — `CREATE TYPE "BookingStatus"` и `ALTER TABLE … ADD COLUMN …` без `DROP`: **добавление безопасно**, всё остальное не трогаем. Допиши в **начало** этого файла две функции нормализации (нужны для backfill; они же останутся в истории, и любой может проиграть миграции с нуля):
 
-```sql
+```sql prepend=prisma/migrations/*_expand_clean_columns/migration.sql
 -- в начало prisma/migrations/…_expand_clean_columns/migration.sql
 -- 1) три формата даты → date
 CREATE FUNCTION legacy_to_date(v text) RETURNS date LANGUAGE sql IMMUTABLE AS $$
@@ -227,7 +231,7 @@ $$;
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev
-npx prisma generate
+npm run generate
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
 psqlr -c "SELECT legacy_to_date('15.01.2026'), legacy_to_date('2026-01-15'), legacy_to_date('1768435200'), legacy_to_money('1 200,00 руб'), legacy_to_money('1200.00'), legacy_to_money('1200,0')"
 ```
@@ -439,14 +443,14 @@ console.log('meta в jsonb:', n2, ' в карантин:', n3)
 // 3. платежи: paid (два формата) → paid_at; клиенты: created → created_at (часы центрального офиса — Москва)
 const n4 = await prisma.$executeRaw`
   UPDATE "tbl_Payments" SET paid_at = (CASE
-      WHEN paid ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$' THEN to_timestamp(paid, 'YYYY-MM-DD HH24:MI:SS')
-      WHEN paid ~ '^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$'     THEN to_timestamp(paid, 'DD.MM.YYYY HH24:MI') END)
+      WHEN paid ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$' THEN to_timestamp(paid, 'YYYY-MM-DD HH24:MI:SS')
+      WHEN paid ~ '^[0-9]{2}[.][0-9]{2}[.][0-9]{4} [0-9]{2}:[0-9]{2}$' THEN to_timestamp(paid, 'DD.MM.YYYY HH24:MI') END)
       ::timestamp AT TIME ZONE 'Europe/Moscow'
   WHERE paid_at IS NULL AND paid IS NOT NULL`
 const n5 = await prisma.$executeRaw`
   UPDATE "tbl_Customers" SET created_at = (CASE
-      WHEN created ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$' THEN to_timestamp(created, 'YYYY-MM-DD HH24:MI')
-      WHEN created ~ '^\d{2}\.\d{2}\.\d{4}$'           THEN to_timestamp(created, 'DD.MM.YYYY') END)
+      WHEN created ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}$' THEN to_timestamp(created, 'YYYY-MM-DD HH24:MI')
+      WHEN created ~ '^[0-9]{2}[.][0-9]{2}[.][0-9]{4}$' THEN to_timestamp(created, 'DD.MM.YYYY') END)
       ::timestamp AT TIME ZONE 'Europe/Moscow'
   WHERE created_at IS NULL AND created IS NOT NULL`
 console.log('платежей:', n4, ' клиентов:', n5)
@@ -461,6 +465,8 @@ npx tsx scripts/backfill-misc.ts
 ### result
 ```out auto
 ```
+
+**Обрати внимание на `[0-9]` вместо привычного `\d`.** В шаблонной строке TypeScript обратная косая черта «съедается» ещё до отправки в базу (`\d` превращается в `d`), регулярное выражение молча перестаёт совпадать — и `UPDATE` честно обновит строки значением `NULL`. Поэтому в SQL внутри `` $executeRaw`…` `` пишем классы символов без обратной косой черты (`[0-9]`, `[.]`). Именно такую ловушку и ловит последняя проверка шага.
 
 Ожидаем: статусов — 300 000; `meta` в `jsonb` — около 3 800, в карантин — около 120 (те самые битые); платежей — все; клиентов — все. Сверка:
 
@@ -488,6 +494,7 @@ SQL
 ### deep Если не получилось
 - **`invalid input value for enum`** — в `status` есть число вне 0–7; найди (`SELECT DISTINCT status`) и дополни расшифровку.
 - **`function pg_input_is_valid does not exist`** — версия PostgreSQL ниже 16; у нас 18, проверь `SELECT version()`.
+- **`платежей_без_даты` равно числу платежей** — в регулярках остались `\d` (см. выше): замени на `[0-9]` и запусти скрипт ещё раз (он идемпотентен только для `meta`/статусов; для дат добавь в условия `paid_at IS NULL`, как уже сделано).
 - **`потеряно > 0`** — в `meta` пустая строка `''` (не `NULL`): `''::jsonb` невалидна и попала бы в карантин, но проверь условия `NOT pg_input_is_valid(...)`.
 
 ### quiz
@@ -519,10 +526,22 @@ ls -lh starter/rental-before-contract.dump
 ```out auto
 ```
 
-**Шаг 2 — contract-миграция.** Создай пустую (`--create-only` без изменений схемы не создаст — сделай папку руками: `prisma/migrations/20261020140000_contract_clean_columns/migration.sql`) с защитной проверкой, удалением старого и переименованием нового:
+**Шаг 2 — contract-миграция.** Создай пустую миграцию (изменений в схеме нет, поэтому Prisma сделает файл с одним комментарием, который мы заменим):
 
-```sql
--- prisma/migrations/20261020140000_contract_clean_columns/migration.sql
+```bash run
+cd ~/prisma-lab/rentkit
+npx prisma migrate dev --create-only --name contract_clean_columns
+ls prisma/migrations | tail -3
+```
+
+### result
+```out auto
+```
+
+Впиши в её `migration.sql` защитную проверку, удаление старого и переименование нового:
+
+```sql into=prisma/migrations/*_contract_clean_columns/migration.sql
+-- prisma/migrations/<метка>_contract_clean_columns/migration.sql
 
 -- 0. защита: ничего не удаляем, если новое заполнено не везде
 DO $$
@@ -612,12 +631,93 @@ model Customer {
 }
 ```
 
+```prisma schema hidden
+model Booking {
+  id         Int            @id @default(autoincrement())
+  customerId Int?           @map("cust_id")
+  itemId     Int?           @map("item_id")
+  branchId   Int?           @map("branch_id")
+  startsAt   DateTime?      @map("starts_at") @db.Timestamptz(3)
+  endsAt     DateTime?      @map("ends_at") @db.Timestamptz(3)
+  total      Decimal?       @db.Decimal(12, 2)
+  deposit    Decimal?       @db.Decimal(12, 2)
+  status     BookingStatus?
+  note       String?
+
+  customer   Customer?    @relation(fields: [customerId], references: [id])
+  item       Item?        @relation(fields: [itemId], references: [id])
+  branch     Branch?      @relation(fields: [branchId], references: [id])
+  payments   Payment[]
+  depositLog DepositLog[]
+
+  @@index([customerId])
+  @@index([itemId])
+  @@index([branchId])
+  @@index([branchId, status, id(sort: Desc)], name: "bookings_branch_status_id")
+  @@map("tbl_Bookings")
+}
+
+model Payment {
+  id        Int       @id @default(autoincrement())
+  bookingId Int?      @map("booking_id")
+  amount    Decimal?  @db.Decimal(12, 2)
+  paidAt    DateTime? @map("paid_at") @db.Timestamptz(3)
+  kind      Int?      @db.SmallInt
+  extRef    String?   @map("ext_ref")
+
+  booking Booking? @relation(fields: [bookingId], references: [id])
+
+  @@index([bookingId])
+  @@map("tbl_Payments")
+}
+
+model Item {
+  id         Int      @id @default(autoincrement())
+  branchId   Int?     @map("branch_id")
+  sku        String?  @unique @db.VarChar(30)
+  title      String?
+  category   String?  @db.VarChar(40)
+  dailyPrice Decimal? @map("daily_price") @db.Decimal(12, 2)
+  deposit    Decimal? @db.Decimal(12, 2)
+  active     Int?     @db.SmallInt
+  metaJson   Json?    @map("meta_json") @db.JsonB
+  metaRaw    String?  @map("meta_raw")
+
+  branch   Branch?   @relation(fields: [branchId], references: [id])
+  bookings Booking[]
+
+  @@index([branchId])
+  @@map("tbl_Items")
+}
+
+model Customer {
+  id        Int       @id @default(autoincrement())
+  name      String?   @map("CustName")
+  phone     String?
+  email     String?
+  branchId  Int?      @map("branch_id")
+  createdAt DateTime? @map("created_at") @db.Timestamptz(3)
+
+  branch   Branch?   @relation(fields: [branchId], references: [id])
+  bookings Booking[]
+
+  @@index([branchId])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "customers_name_trgm")
+  @@index([name])
+  @@map("tbl_Customers")
+}
+```
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && node -e "const fs=require('fs');const c=JSON.parse(fs.readFileSync('tsconfig.json'));c.include=['src/data','src/lib','src/db.ts','src/domain','scripts','prisma.config.ts'];fs.writeFileSync('tsconfig.json',JSON.stringify(c,null,2))"
+```
+
 Старые «уроки» (`src/lessons`, `src/intro`) используют удалённые поля и перестанут компилироваться. Вынеси их из проверки типов — в `tsconfig.json` замени `include` на `["src/data", "src/lib", "src/db.ts", "src/domain", "scripts", "prisma.config.ts"]`; сами файлы оставь как архив.
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npx prisma migrate dev
-npx prisma generate
+npx prisma migrate dev --name sync_after_contract
+npm run generate
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
 psqlr -c '\d "tbl_Bookings"'
 npm run typecheck

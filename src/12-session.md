@@ -92,9 +92,9 @@ SQL_LOG=1 npx tsx src/lessons/12-tx.ts 2>&1 | grep -E 'BEGIN|COMMIT|ROLLBACK|^\w
 
 В PostgreSQL-лабе (сессия 5) ты видела это на `pgbench`. Теперь повторим через Prisma. Заведём клиенту счётчик баллов и версию (понадобится в 12.3):
 
-```prisma
+```prisma schema
 model Customer {
-  // …
+  // …поля как раньше…
   bonusPoints Int @default(0) @map("bonus_points")
   version     Int @default(0)
 }
@@ -103,7 +103,7 @@ model Customer {
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --name customer_points_version
-npx prisma generate
+npm run generate
 ```
 
 ### result
@@ -315,6 +315,15 @@ export async function withRetry<T>(fn: () => Promise<T>, tries = 6): Promise<T> 
 
 Теперь вызываем с `isolationLevel: Serializable` и обёрткой повтора (измени последние строки скрипта):
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && node -e "
+const fs=require('fs');const f='src/lessons/12-skew.ts';let s=fs.readFileSync(f,'utf8');
+s=s.replace(\"import { prisma } from '../db.js'\",\"import { prisma } from '../db.js'\\nimport { withRetry } from '../lib/retry.js'\");
+s=s.replace('() => createDraft(c.id)))','() =>\\n  withRetry(() => createDraft(c.id, Prisma.TransactionIsolationLevel.Serializable))))');
+s=s.replace('без защиты, черновиков:','Serializable + retry, черновиков:');
+fs.writeFileSync(f,s)"
+```
+
 ```ts
 import { withRetry } from '../lib/retry.js'
 // …
@@ -392,15 +401,20 @@ npx tsx src/lessons/12-pool.ts
 Ожидаем: успешно ≈ 10, упало ≈ 5 с кодом **`P2028`** (`Unable to start a transaction in the given time` — не дождались свободного соединения за `maxWait`). А с другой стороны (из `psql`) во время такой нагрузки видны сессии `idle in transaction`:
 
 ```bash run
+cd ~/prisma-lab/rentkit
+(npx tsx src/lessons/12-pool.ts > /tmp/pool.log 2>&1 &)
+sleep 2
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
-psqlr "SELECT state, count(*) FROM pg_stat_activity WHERE datname = 'rental' GROUP BY 1"
+psqlr "SELECT state, count(*) FROM pg_stat_activity WHERE datname = 'rental' GROUP BY 1 ORDER BY 2 DESC"
+sleep 6
+cat /tmp/pool.log
 ```
 
 ### result
 ```out auto
 ```
 
-(Запускай эту проверку параллельно с работающим скриптом, в соседнем терминале.) Состояние **`idle in transaction`** — транзакция открыта, но ничего не делает: она держит блокировки и соединение. Это одно из самых вредных состояний в базе: прямое следствие «долгой работы внутри транзакции».
+(Скрипт запущен в фоне, а `psql` смотрит на базу через две секунды — пока транзакции «работают»; у себя то же можно сделать в соседнем терминале.) Состояние **`idle in transaction`** — транзакция открыта, но ничего не делает: она держит блокировки и соединение. Это одно из самых вредных состояний в базе: прямое следствие «долгой работы внутри транзакции».
 
 Три рычага защиты: (1) **не делать долгого внутри транзакции** (внешние вызовы — до или после); (2) **`timeout`** — максимальное время жизни транзакции; (3) на стороне базы — **`idle_in_transaction_session_timeout`** (параметр сервера, который сам оборвёт «застрявшую»); о таймаутах запросов — сессия 17.6.
 
@@ -429,7 +443,7 @@ psqlr "SELECT state, count(*) FROM pg_stat_activity WHERE datname = 'rental' GRO
 
 Заведём очередь (таблицы без моделей Prisma не оставляем — добавим модели):
 
-```prisma
+```prisma schema
 model PickupJob {
   id        Int       @id @default(autoincrement())
   bookingId Int       @map("booking_id")
@@ -451,7 +465,7 @@ model JobClaimLog {
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --name pickup_queue
-npx prisma generate
+npm run generate
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr "INSERT INTO pickup_job (booking_id) SELECT id FROM \"tbl_Bookings\" WHERE status = 'CONFIRMED' ORDER BY id LIMIT 2000"
 psqlr "SELECT count(*) AS заданий FROM pickup_job WHERE state = 'new'"
@@ -552,7 +566,7 @@ async function touch(first: number, second: number) {
 
 const results = await Promise.allSettled([touch(1, 2), touch(2, 1)])
 for (const r of results) {
-  console.log(r.status, r.status === 'rejected' ? `${(r.reason as any).code}: ${String((r.reason as Error).message).split('\n')[0]}` : '')
+  console.log(r.status, r.status === 'rejected' ? `${(r.reason as any).code}: ${String((r.reason as Error).message).trim().split('\n')[0]}` : '')
 }
 await prisma.$disconnect()
 ```
@@ -566,7 +580,7 @@ npx tsx src/lessons/12-deadlock.ts
 ```out auto
 ```
 
-Ожидаем: одна транзакция успешна, другая отклонена с **`P2034`** («Transaction failed due to a write conflict or a deadlock») — база обнаружила взаимную блокировку (в логе PostgreSQL — `deadlock detected`, код `40P01`) и отменила одну. Повтор помогает (потому и «повторить — работает»), но лучше устранить причину.
+Ожидаем: одна транзакция успешна, другая отклонена с кодом **`P2034`** (в выводе после кода — только первая строка сообщения Prisma, `Invalid tx.item.update() invocation`; по документации код означает «write conflict or a deadlock») — база обнаружила взаимную блокировку (в логе PostgreSQL — `deadlock detected`, код `40P01`) и отменила одну. Повтор помогает (потому и «повторить — работает»), но лучше устранить причину.
 
 **Твоя задача:** переписать `touch` так, чтобы дедлок был **невозможен**, а не просто повторялся. Условия: тот же результат, поведение для вызывающих то же. Покажи, что `Promise.allSettled([touch(1,2), touch(2,1)])` теперь всегда обе успешны (прогони 20 раз). Подсказка в «Если не получилось».
 

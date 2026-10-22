@@ -11,7 +11,7 @@ dur: ~4 ч
 
 Раньше `db pull` не создал связей, потому что их нет в базе. Опишем их сами. Сначала режим связей в `datasource` — «без ключей на стороне базы»:
 
-```prisma
+```prisma schema
 datasource db {
   provider     = "postgresql"
   relationMode = "prisma"
@@ -20,7 +20,7 @@ datasource db {
 
 Затем связи. В каждой связи две стороны: **скалярное поле** (`customerId`) и **поле-связь** (`customer`); связь описывается атрибутом `@relation(fields: [...], references: [...])` на стороне, где лежит ключ.
 
-```prisma
+```prisma schema
 model Branch {
   // …поля как раньше…
   items     Item[]
@@ -73,6 +73,7 @@ npx prisma format
 npx prisma validate
 npx prisma generate
 npx prisma migrate dev --create-only --name relations_indexes
+cat prisma/migrations/*_relations_indexes/migration.sql
 ```
 
 ### result
@@ -82,6 +83,10 @@ npx prisma migrate dev --create-only --name relations_indexes
 Что здесь происходит: (1) `relationMode = "prisma"` не создаёт внешних ключей на уровне базы — не должно быть ни `FOREIGN KEY` в миграции, ни падений на сиротах; (2) при этом `@@index` на каждом поле связи **обязателен по рекомендации Prisma** (в этом режиме нет индексов, которые обычно создаются вместе с ключом) — и именно эти индексы появятся в созданной миграции (`CREATE INDEX`); (3) поля-связи (`customer`, `branch`…) в базе **не существуют** — это только описание для клиента.
 
 Открой созданный `migration.sql` и убедись: там только `CREATE INDEX`, никаких `FOREIGN KEY`. Если всё так — примени его (`npx prisma migrate dev`), иначе не применяй и найди причину.
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate deploy && npx prisma generate
+```
 
 ### why
 Это принципиальный выбор: **связь в схеме ≠ ограничение в базе**. Пока у нас сироты (бронь без клиента) и нет ключей, база разрешает нарушать целостность, а Prisma — нет, но только для тех, кто пишет через неё. Настоящие внешние ключи появятся после чистки (сессия 11), тогда `relationMode` вернётся к значению по умолчанию. А индексы под них полезны уже сейчас: большая часть запросов в наследстве идёт по `cust_id` и `item_id`.
@@ -286,6 +291,10 @@ npx tsx src/lessons/06-cure.ts
 ```out auto
 ```
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && grep -q relationJoins prisma/schema.prisma || sed -i 's|provider = "prisma-client"|provider = "prisma-client"\n  previewFeatures = ["relationJoins"]|' prisma/schema.prisma && sed -i "s/  take: 200,/  take: 200,\n  relationLoadStrategy: 'join',/" src/lessons/06-cure.ts && npx prisma generate
+```
+
 Вместо 401 запроса — **три** (основной, клиенты `IN (...)`, предметы `IN (...)`). Второе лечение — «соединение на стороне базы». Для него в Prisma 7 нужна **предпросмотровая возможность** (**сверьтесь**: на момент написания `relationLoadStrategy` документирован как Preview): добавь в `generator` `previewFeatures = ["relationJoins"]`, затем `npx prisma generate` и попроси стратегию в запросе:
 
 ```ts
@@ -357,9 +366,9 @@ console.log(overdue)
 const dead = await prisma.item.count({ where: { bookings: { none: {} } } })
 console.log('предметов без броней:', dead)
 
-// брони, у которых клиента нет в таблице (сироты): is null
-const orphans = await prisma.booking.count({ where: { customer: { is: null } } })
-console.log('сирот без клиента:', orphans)
+// брони, у которых поле клиента пустое (NULL) — не путать с «сиротами»!
+const noCustomer = await prisma.booking.count({ where: { customer: { is: null } } })
+console.log('броней с пустым cust_id:', noCustomer)
 await prisma.$disconnect()
 ```
 
@@ -373,9 +382,9 @@ npx tsx src/lessons/06-relfilter.ts
 ```out auto
 ```
 
-В SQL это `EXISTS (SELECT … WHERE …)` / `NOT EXISTS` — подзапрос на каждую строку: на больших таблицах без индексов по полю связи (мы добавили их в 6.1: `@@index([customerId])`) работает медленно. Проверь `EXPLAIN` запроса про «мёртвый склад»: без индекса по `item_id` он читает 300 тысяч броней для **каждого** из 4 000 предметов.
+В SQL это `EXISTS (SELECT … WHERE …)` / `NOT EXISTS` — подзапрос на каждую строку: на больших таблицах без индексов по полю связи (мы добавили их в 6.1: `@@index([customerId])`) работает медленно. Проверь `EXPLAIN` запроса про «мёртвый склад» (`NOT EXISTS`): с индексом из 6.1 это `Nested Loop Anti Join` и `Index Only Scan using "tbl_Bookings_item_id_idx"` — около 4 мс на все 4 000 предметов; без индекса по `item_id` планировщику пришлось бы просматривать таблицу броней целиком (в сессии 8 сравним на своей базе). В нашей базе у каждого предмета есть хотя бы одна бронь, поэтому ответ — `0`.
 
-**Сироты:** `customer: { is: null }` — это ровно «брони без клиента» (бронь есть, а связанной строки нет); полезный запрос аудита из шага 3.1, теперь через Prisma.
+**Осторожно: это не «сироты».** `customer: { is: null }` в SQL превращается в `WHERE cust_id IS NULL` (посмотри в логе): находятся только брони, у которых **поле клиента пустое**. Их у нас `0`. А вот полторы тысячи **осиротевших** броней из шага 3.1 — те, где `cust_id` заполнен, но такого клиента нет, — этот фильтр **не видит**: для Prisma со `relationMode = "prisma"` связь «не найдена» и «не указана» — разные вещи. Настоящих сирот ищут соединением (`LEFT JOIN … WHERE c.id IS NULL` — тот самый запрос из 3.1; через Prisma — `$queryRaw`, сессия 9).
 
 ### why
 Фильтры по связям красивы и компактны, но превращаются в подзапросы, стоимость которых легко недооценить. Поэтому после каждого такого фильтра смотри план: если есть `Seq Scan` по большой таблице внутри `SubPlan`, нужен индекс (сессия 8).
@@ -387,7 +396,7 @@ npx tsx src/lessons/06-relfilter.ts
 ### quiz
 - Что делают `some`, `every`, `none` и во что они превращаются в SQL?
 - Почему такие фильтры бывают медленными без индекса по полю связи?
-- Как найти «сирот» запросом Prisma?
+- Почему фильтр `customer: { is: null }` не находит «сирот» (броней с несуществующим клиентом) и как их найти?
 
 ### links
 - https://www.prisma.io/docs/orm/v7/prisma-client/queries/relation-queries#filter-on-absence-of--records | фильтр по связям | Prisma 7: Relation queries
@@ -492,7 +501,44 @@ SQL_LOG=1 npx tsx src/lessons/06-slow.ts 2>&1 | tail -6
 ```out auto
 ```
 
-**Твоя задача** — найти причину и исправить. Подсказки лежат в «Если не получилось», а не здесь. Требования: (1) число запросов к базе — **не больше трёх** на 100 клиентов; (2) время — **не больше 200 мс** (если без индексов не получается — отметь это и вернись в сессии 8: индекс по `payments.booking_id` у нас есть из 6.1); (3) результат тот же; (4) докажи числами: «было N запросов и T мс, стало M и t».
+**Твоя задача** — найти причину и исправить. Подсказки лежат в «Если не получилось», а не здесь. Требования: (1) число запросов к базе — **не больше трёх** на 100 клиентов; (2) время — **заметно меньше**: у нас на ноутбуке исходный вариант занял около 135 мс (база рядом, сеть почти бесплатна), а правильный — около 25 мс; на удалённой базе, где каждый запрос — поездка по сети на 1–5 мс и очередь в пуле из 10 соединений, разница вырастает до секунд, как и в жалобе; (3) результат тот же; (4) докажи числами: «было N запросов и T мс, стало M и t».
+
+```ts file=src/lessons/06-fast.ts hidden
+import { prisma } from '../db.js'
+
+let queries = 0
+prisma.$on('query', () => { queries++ })
+
+export async function customersWithLastPayment(limit = 100) {
+  const customers = await prisma.customer.findMany({ take: limit, orderBy: { id: 'asc' } })
+  const bookings = await prisma.booking.findMany({
+    where: { customerId: { in: customers.map((c) => c.id) } },
+    select: { id: true, customerId: true },
+  })
+  const owner = new Map(bookings.map((b) => [b.id, b.customerId]))
+  const payments = await prisma.payment.findMany({
+    where: { bookingId: { in: bookings.map((b) => b.id) } },
+    select: { id: true, bookingId: true, amount: true },
+    orderBy: { id: 'desc' },
+  })
+  const last = new Map<number, number | null>()
+  for (const p of payments) {
+    const cid = owner.get(p.bookingId ?? -1)
+    if (cid != null && !last.has(cid)) last.set(cid, p.amount)
+  }
+  return customers.map((c) => ({ id: c.id, name: c.name, lastPaid: last.get(c.id) ?? null }))
+}
+
+console.time('fast')
+const rows = await customersWithLastPayment(100)
+console.timeEnd('fast')
+console.log(rows.length, 'строк,', queries, 'запроса')
+await prisma.$disconnect()
+```
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx tsx src/lessons/06-fast.ts && npx tsx src/lessons/06-slow.ts | tail -3
+```
 
 **Приёмка сессии:** схема со связями (без внешних ключей) и индексами по полям связи применена миграцией `relations_indexes`; N+1 в 6.3 воспроизведён и вылечен через `include`; в 6.7 «последний платёж клиента» собирается тремя запросами или меньше; в `NOTES.md` записаны цифры «до» и «после».
 

@@ -16,7 +16,7 @@ dur: ~4 ч
 export async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> {
   const t0 = performance.now()
   const r = await fn()
-  console.log(label.padEnd(34), (performance.now() - t0).toFixed(1).padStart(8), 'ms')
+  console.log(label.padEnd(40), (performance.now() - t0).toFixed(1).padStart(8), 'ms')
   return r
 }
 ```
@@ -26,6 +26,7 @@ export async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> 
 import { prisma } from '../db.js'
 import { timed } from '../lib/timed.js'
 
+await prisma.booking.count()                  // прогрев: первый запрос открывает соединение и портит замер
 for (const page of [1, 100, 1000, 5000]) {
   await timed(`страница ${page}, сортировка по id`, () =>
     prisma.booking.findMany({ orderBy: { id: 'asc' }, skip: (page - 1) * 50, take: 50 }))
@@ -47,7 +48,7 @@ npx tsx src/lessons/08-offset.ts
 ```out auto
 ```
 
-Ожидаем два эффекта: (1) при сортировке по `id` время **растёт с глубиной** (индекс первичного ключа помогает идти по порядку, но пропущенные строки всё равно «прочитываются»); (2) при сортировке по полю **без индекса** база **сортирует все 300 тысяч строк** на каждой странице — и первая страница уже медленная. Числа у тебя будут свои; важна **форма**: линейный рост от глубины.
+Ожидаем два эффекта: (1) при сортировке по `id` время **растёт с глубиной** (индекс первичного ключа помогает идти по порядку, но пропущенные строки всё равно «прочитываются»); (2) при сортировке по полю **без индекса** база **сортирует все 300 тысяч строк** на каждой странице — и первая страница уже медленная. Числа у тебя будут свои; важна **форма**: линейный рост от глубины (у нас 1,9 → 4,5 → 20 мс; самая первая строка вывода бывает выше — «холодный» запрос: планировщик и кеш ещё не прогреты, на форму не смотри).
 
 ### why
 Пагинация «страница N из M» — самый частый и самый коварный запрос на административных страницах. На тысяче строк она незаметна, на миллионе — «тормозит страница заказов». Понимать, почему `OFFSET` линеен, — основа выбора между постраничной выборкой и «курсором» (шаг 8.2).
@@ -102,6 +103,7 @@ async function nextPageKeyset(afterId = 0) {
 }
 
 let last = 0
+await nextPage()                      // прогрев
 for (let i = 0; i < 5000; i++) {     // 5000 страниц = 250 000 строк
   const rows = await nextPage(last || undefined)
   if (rows.length < 50) break
@@ -117,14 +119,14 @@ await prisma.$disconnect()
 
 ```bash run
 cd ~/prisma-lab/rentkit
-SQL_LOG=1 npx tsx src/lessons/08-cursor.ts 2>&1 | tail -12
+npx tsx src/lessons/08-cursor.ts
 ```
 
 ### result
 ```out auto
 ```
 
-Что видно: `cursor` и «ручной» keyset на пятитысячной странице так же быстры, как на первой, а `skip` — заметно медленнее. В SQL `cursor` превращается в условие `id >= $cursor` (плюс `skip: 1` пропускает саму закладку); ручной keyset — `id > $last`. Для составных порядков (по `startText`, потом `id`) условие keyset выглядит как `(startText, id) > ($a, $b)` — Prisma `cursor` такое умеет частично, и для сложных случаев проще написать условие самой.
+Что видно: `cursor` и «ручной» keyset на пятитысячной странице так же быстры, как на первой, а `skip` — заметно медленнее (у нас 0,3 мс у `cursor` и 12,8 мс у `skip`; 8 мс у keyset — «холодный» запрос, на повторе будет доли миллисекунды: числа в миллисекундах шумят, смотри на порядок). В SQL `cursor` превращается в условие `id >= $cursor` (плюс `skip: 1` пропускает саму закладку); ручной keyset — `id > $last`. Для составных порядков (по `startText`, потом `id`) условие keyset выглядит как `(startText, id) > ($a, $b)` — Prisma `cursor` такое умеет частично, и для сложных случаев проще написать условие самой.
 
 Компромиссы: **нет «страницы №»** (только «дальше/назад»); нужен **уникальный** порядок; добавляя/удаляя строки между запросами, ты не получишь «поплывшей» страницы (плюс по сравнению с `OFFSET`).
 
@@ -177,7 +179,7 @@ psqlr -c "EXPLAIN (ANALYZE, BUFFERS) SELECT id FROM \"tbl_Bookings\" WHERE cust_
 
 Как читать вывод (три главные величины в каждой строке):
 
-- **`Seq Scan on "tbl_Bookings"`** — перебор всей таблицы; в первом запросе `Rows Removed by Filter` — сотни тысяч строк, отброшенных фильтром (признак «ищем иголку без индекса»);
+- **`Seq Scan on "tbl_Bookings"`** — перебор всей таблицы; в первом запросе `Rows Removed by Filter` показывает, сколько строк перебрали и выбросили, пока не набрали 20 подходящих (признак «ищем иголку без индекса»; слово «продлить» встречается часто, поэтому у нас перебор остановился на ≈760 строках, а для редкого слова он шёл бы до конца таблицы);
 - **`Index Scan` / `Index Only Scan` / `Bitmap Index Scan`** — поиск по индексу; второй запрос (по `cust_id`) должен использовать индекс `tbl_Bookings_cust_id_idx`, который мы создали в шаге 6.1;
 - **`actual time=… rows=… loops=…`** — реальное время и число строк (для каждой ступени); `Buffers: shared hit/read` — сколько страниц взято из кэша и с диска; **`Planning Time` / `Execution Time`** внизу.
 
@@ -223,9 +225,9 @@ psqlr "EXPLAIN (ANALYZE) SELECT id FROM \"tbl_Bookings\" WHERE branch_id = 5 AND
 
 Индекс по `branch_id` у нас уже есть (шаг 6.1), поэтому планировщик возьмёт его, а потом отфильтрует по `status` и отсортирует. Составной индекс `(branchId, status, id)` проведёт к нужным строкам **сразу и уже в нужном порядке**. Добавим его в схему:
 
-```prisma
+```prisma schema
 model Booking {
-  // …
+  // …поля как раньше…
   @@index([customerId])
   @@index([itemId])
   @@index([branchId])
@@ -244,7 +246,7 @@ psqlr "EXPLAIN (ANALYZE) SELECT id FROM \"tbl_Bookings\" WHERE branch_id = 5 AND
 ```out auto
 ```
 
-Ожидаем `Index Scan using bookings_branch_status_id` и **почти нулевое** время. Правила составных индексов:
+Ожидаем `Index Only Scan using bookings_branch_status_id` (индекс покрывает всё, что нужно запросу, в таблицу заглядывать не надо) и **почти нулевое** время (у нас ≈0,2 мс против ≈2,6 мс до индекса). Правила составных индексов:
 
 - **Порядок колонок важен.** Индекс `(a, b, c)` помогает запросам по `a`, по `a и b`, по `a, b, c` — но **не** запросу по одному `b`.
 - Сначала колонки, по которым **равенство** (`branchId = 5`, `status = 6`), потом — по которым **диапазон/сортировка** (`id DESC`).
@@ -284,15 +286,17 @@ psqlr "EXPLAIN (ANALYZE) SELECT id FROM \"tbl_Bookings\" WHERE branch_id = 5 AND
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --create-only --name custom_indexes
 ls prisma/migrations | tail -2
+cat prisma/migrations/*_custom_indexes/migration.sql
 ```
 
 ### result
 ```out auto
 ```
 
-Если Prisma пишет, что схема и база в синхроне и миграция не создана, создай папку вручную (как в шаге 3.6): `prisma/migrations/20261020110000_custom_indexes/migration.sql`. Содержимое:
+Prisma создала папку с **пустым** `migration.sql` (одна строка-комментарий `-- This is an empty migration.`) — так и задумано: файл твой, и ты вписываешь в него свой SQL (метка времени в имени папки у тебя будет другая):
 
-```sql
+```sql into=prisma/migrations/*_custom_indexes/migration.sql
+-- prisma/migrations/<метка>_custom_indexes/migration.sql
 -- триграммный поиск «содержит» по имени клиента (ILIKE '%иван%')
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX "customers_name_trgm" ON "tbl_Customers" USING gin ("CustName" gin_trgm_ops);
@@ -306,7 +310,7 @@ CREATE INDEX "customers_phone10" ON "tbl_Customers" (right(regexp_replace("phone
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npx prisma migrate dev
+npx prisma migrate deploy
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr "EXPLAIN (ANALYZE) SELECT id FROM \"tbl_Customers\" WHERE \"CustName\" ILIKE '%иван%' LIMIT 10"
 psqlr "EXPLAIN (ANALYZE) SELECT id FROM \"tbl_Bookings\" WHERE status = 6 AND branch_id = 5 ORDER BY id DESC LIMIT 20"
@@ -316,18 +320,46 @@ psqlr "EXPLAIN (ANALYZE) SELECT id FROM \"tbl_Bookings\" WHERE status = 6 AND br
 ```out auto
 ```
 
-**Важная проверка.** Эти индексы Prisma-схема не описывает. Убедись, что следующая автоматическая миграция **не пытается их удалить**:
+Здесь мы применили миграцию командой `migrate deploy` (она только применяет готовые миграции и ни о чём не спрашивает). Обычный `migrate dev` на этом месте тоже применил бы её — но дальше ещё и сравнил бы схему с базой (об этом сразу ниже).
+
+**Важная проверка.** Эти индексы Prisma-схема не описывает. Убедись, что следующая автоматическая миграция **не пытается их удалить** — создадим её с `--create-only` и посмотрим внутрь:
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npx prisma migrate dev --create-only --name should_be_empty_again
+npx prisma migrate dev --create-only --name drift_check
+cat prisma/migrations/*_drift_check/migration.sql
+rm -r prisma/migrations/*_drift_check
+psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
+psqlr "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname IN ('bookings_overdue', 'customers_phone10', 'customers_name_trgm')"
 ```
 
 ### result
 ```out auto
 ```
 
-Ожидаем «Already in sync…» (**сверьтесь**: Prisma не должна считать частичные и выражения «лишними»). Если создалась миграция с `DROP INDEX` — **не применяй**: удали папку миграции; в таком случае индексы приходится описывать в схеме комментарием и следить вручную (или использовать расширения схемы для PostgreSQL — страница «PostgreSQL extensions» в документации).
+**Сюрприз.** Частичный индекс `bookings_overdue` и индекс по выражению `customers_phone10` Prisma не трогает — она их просто не понимает и пропускает. А вот **триграммный GIN-индекс** `customers_name_trgm` она *понимает* (тип индекса `Gin` и класс операторов можно описать в схеме), видит, что в схеме его нет, и в черновике миграции стоит `DROP INDEX "customers_name_trgm"`. Если бы мы нажали Enter в `migrate dev` — индекс исчез бы молча. Поэтому папку-черновик мы удалили (`rm -r`), а индекс **описываем в схеме** — тогда схема и база совпадают:
+
+```prisma schema
+model Customer {
+  // …поля как раньше…
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "customers_name_trgm")
+}
+```
+
+Повтори проверку — теперь черновик должен быть пустым (индексы `bookings_overdue` и `customers_phone10` по-прежнему на месте):
+
+```bash run
+cd ~/prisma-lab/rentkit
+npx prisma migrate dev --create-only --name drift_check
+cat prisma/migrations/*_drift_check/migration.sql
+rm -r prisma/migrations/*_drift_check
+```
+
+### result
+```out auto
+```
+
+Правило: **после любой ручной SQL-миграции с индексом или ограничением делай `migrate dev --create-only` и читай черновик.** Если внутри `DROP INDEX`/`DROP CONSTRAINT` — не применяй: удали папку-черновик и опиши объект в схеме (если Prisma его умеет) либо оставь как есть (если её не волнует, как с частичным индексом и индексом по выражению). Подробнее о том, что умеет схема, — страница «PostgreSQL extensions» в документации.
 
 ### why
 Здесь проходит граница возможностей ORM: схема Prisma — подмножество того, что умеет PostgreSQL. Знать, как выйти за эту границу **не ломая** процесс миграций, — одно из главных практических умений. Вся история базы по-прежнему в `prisma/migrations`, просто часть SQL написана руками.
@@ -363,15 +395,17 @@ npx prisma migrate dev --create-only --name should_be_empty_again
 import { prisma } from '../db.js'
 import { timed } from '../lib/timed.js'
 
+await prisma.item.count()                                        // прогрев соединения
 await timed('count() всех броней', () => prisma.booking.count())
 await timed('count() с условием без индекса', () => prisma.booking.count({ where: { note: { not: null } } }))
 await timed('count() с условием по индексу', () => prisma.booking.count({ where: { branchId: 5, status: 6 } }))
 
 // приблизительно — из статистики планировщика (мгновенно)
-await timed('оценка из pg_class', async () => {
+const estimate = await timed('оценка из pg_class', async () => {
   const [r] = await prisma.$queryRaw<{ estimate: bigint }[]>`SELECT reltuples::bigint AS estimate FROM pg_class WHERE relname = 'tbl_Bookings'`
-  console.log('  ≈', r!.estimate)
+  return r!.estimate
 })
+console.log('  ≈', estimate)
 await prisma.$disconnect()
 ```
 
@@ -384,7 +418,7 @@ npx tsx src/lessons/08-count.ts
 ```out auto
 ```
 
-Ожидаем: `count()` целой таблицы — десятки миллисекунд (PostgreSQL читает таблицу или индекс целиком), `count` с условием по индексу — быстрый, оценка из `pg_class` — **мгновенно**, но приблизительно (точность зависит от свежести статистики: `ANALYZE`/автовакуум). Практика для интерфейсов со страницами: не считать «всего» на каждый запрос; показывать «≈ 300 тыс.», или считать один раз и кешировать, или вообще отказаться от «страница X из Y» в пользу «дальше».
+Ожидаем: `count()` целой таблицы — порядка десяти миллисекунд (PostgreSQL читает таблицу или индекс целиком; на миллионе строк это уже сотни), `count` с условием по индексу — быстрый (доли миллисекунды), оценка из `pg_class` — **мгновенно**, но приблизительно (точность зависит от свежести статистики: `ANALYZE`/автовакуум). Практика для интерфейсов со страницами: не считать «всего» на каждый запрос; показывать «≈ 300 тыс.», или считать один раз и кешировать, или вообще отказаться от «страница X из Y» в пользу «дальше».
 
 ### why
 `count` — одна из самых частых скрытых причин медленных страниц: «нарисуем и общее число страниц» превращается в полный проход таблицы на каждый показ. Знание цены операции помогает выбирать между точностью и скоростью осознанно.
@@ -413,9 +447,9 @@ npx tsx src/lessons/08-count.ts
 
 Воспроизведи: индекс на имя (B-tree) и поиск «без учёта регистра» из Prisma.
 
-```prisma
+```prisma schema
 model Customer {
-  // …
+  // …поля как раньше…
   name String? @map("CustName")
   @@index([name])
 }
@@ -438,7 +472,7 @@ SQL_LOG=1 npx tsx src/lessons/08-noindex.ts 2>&1 | grep -E 'LIKE|ILIKE|=' | head
 ```out auto
 ```
 
-Три запроса — три разных SQL: `equals` с `insensitive` → **`ILIKE`** (без учёта регистра), `contains` → `LIKE '%ван%'` (**ведущий** `%`), `startsWith` → `LIKE 'Иван%'`. Прогони каждый через `EXPLAIN ANALYZE` в `psql` и посмотри, какой использует индекс `customers_name_idx`. Ожидаем: только `startsWith` (B-tree умеет искать по началу строки — и то если колонка в подходящем collation: **сверьтесь**; иначе нужен `text_pattern_ops`).
+Три запроса — три разных SQL: `equals` с `insensitive` → **`ILIKE`** (без учёта регистра), `contains` → `LIKE '%ван%'` (**ведущий** `%`), `startsWith` → `LIKE 'Иван%'`. Прогони каждый через `EXPLAIN ANALYZE` в `psql` и посмотри, какой использует индекс `tbl_Customers_CustName_idx`. Ожидаем: только `startsWith` (B-tree умеет искать по началу строки — и то если колонка в подходящем collation: **сверьтесь**; иначе нужен `text_pattern_ops`).
 
 **Твоя задача:** добиться, чтобы **все три** работали по индексам. Условия: схему менять можно, ручной SQL-миграцией — тоже; поведение запросов не менять. Подсказки — в «Если не получилось».
 

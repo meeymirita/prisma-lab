@@ -9,6 +9,8 @@
 | `Environment variable not found: DATABASE_URL` | `.env` не подхвачен | `import 'dotenv/config'` в `prisma.config.ts` и в `db.ts` |
 | `datasource property url is no longer supported` | адрес остался в `schema.prisma` | адрес — только в `prisma.config.ts` |
 | `Cannot find module './generated/prisma/client.js'` | не запущен `generate` или другой `output` | `npx prisma generate`; проверить `output` (4.6) |
+| `Cannot find module '…/generated/prisma/sql.js'` или `TS2307` на импорте TypedSQL | обычный `generate` без `--sql` стёр `sql.ts` | всегда `npm run generate` = `prisma generate --sql` (9.5) |
+| `Failed to load config file … Cannot resolve environment variable: DATABASE_URL` в скрипте | скрипт не импортирует `db.ts`, `.env` никто не прочитал | `import 'dotenv/config'` первой строкой скрипта |
 | типы «старые» после правки схемы | `generate` не запускается сам (Prisma 7) | запускать вручную, добавить в `postinstall` (4.7) |
 | `prisma.$use is not a function` | middleware убран | `$extends` с компонентом `query` (15.1) |
 | ошибка адаптера: `adapter` обязателен | клиент Prisma 7 без `PrismaPg` | передать `adapter` в конструктор (4.6) |
@@ -29,7 +31,10 @@
 | Симптом | Причина | Что делать |
 |---|---|---|
 | `P3005: database schema is not empty` | `migrate deploy` к непустой базе без baseline | baseline: `migrate diff … > 0_init`, `migrate resolve --applied 0_init` (3.4) |
-| `P3006: Migration failed to apply cleanly to the shadow database` | история не проигрывается с нуля | дописать недостающее в `0_init` или исправить миграцию (3.4, 18.3) |
+| `P3006: Migration failed to apply cleanly to the shadow database` | история не проигрывается с нуля | исправить миграцию (3.4, 18.3); частые причины: объект, которого на shadow-базе ещё нет (`_prisma_migrations`, 16.2), и `ALTER COLUMN … DROP DEFAULT` на генерируемой колонке |
+| `column "…" of relation … is a generated column` + `DROP DEFAULT` в автомиграции | Prisma не знает про `GENERATED ALWAYS` | `@default(dbgenerated())` у поля (11.4, 13.3) |
+| `migrate dev --create-only` создал файл с одной строкой `-- This is an empty migration.` | Prisma 7 создаёт файл всегда, даже если менять нечего | это признак «схема = база»; папку удалить (4.5, 8.5) |
+| автомиграция хочет `DROP INDEX` у ручного GIN-индекса | Prisma умеет описать `Gin`-индекс, а он не описан | `@@index([поле(ops: raw("gin_trgm_ops"))], type: Gin, map: "…")` (8.5) |
 | `P3009`/`P3018`: миграция не применилась | SQL упал на базе | прочитать ошибку; исправить новой миграцией; `migrate resolve --rolled-back` |
 | `Drift detected` и вопрос «reset?» | база изменена мимо миграций | **не соглашаться**; откатить правку или зафиксировать миграцией и `resolve --applied` (11.5) |
 | «migration was modified after it was applied» | правили применённую миграцию | вернуть файл; правка — новой миграцией (11.7) |

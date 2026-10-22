@@ -160,7 +160,7 @@ Prisma перечислит найденные таблицы и допишет 
 
 - имена моделей **как у таблиц**: `tbl_Bookings`, `tbl_Customers`… (переименуем в шаге 3.3);
 - **связей (`@relation`) нет** — их нет в базе (нет внешних ключей), Prisma угадывать не умеет;
-- у `tbl_DepositLog` модель либо отсутствует, либо закомментирована с пометкой **`@@ignore`**: в таблице нет первичного ключа и нет уникального индекса, а Prisma **требует у каждой модели уникальный идентификатор** (**сверьтесь** с точным видом пометки в вашей версии);
+- у `tbl_DepositLog` модель есть, но с пометкой **`@@ignore`** и комментарием `/// The underlying table does not contain a valid unique identifier…`, а в выводе `db pull` — предупреждение `The following models were ignored`: в таблице нет первичного ключа и нет уникального индекса, а Prisma **требует у каждой модели уникальный идентификатор** — и клиент такую модель не увидит (разберёмся в шаге 3.6);
 - `daily_price`, `price` — `String`, `deposit` — `Float`, `status` — `Int @db.SmallInt`: Prisma честно описала то, что есть.
 
 ### why
@@ -176,7 +176,7 @@ Prisma перечислит найденные таблицы и допишет 
 
 ### quiz
 - Что делает `prisma db pull` и чего он не может узнать о базе?
-- Почему у `tbl_DepositLog` нет модели или она помечена `@@ignore`?
+- Почему `tbl_DepositLog` помечена `@@ignore`, и что это значит для клиента?
 - Чем опасен повторный `db pull`, если ты уже правила схему?
 
 ### links
@@ -193,7 +193,7 @@ Prisma перечислит найденные таблицы и допишет 
 
 Переименуем **модели** (поля пока оставим как есть — этим займётся сессия 4). Для каждой модели: меняем имя на «нормальное» (в единственном числе, `PascalCase`) и добавляем `@@map` со старым именем таблицы.
 
-```prisma
+```prisma schema
 // prisma/schema.prisma (фрагмент: только заголовки моделей и @@map; тела не трогаем)
 model Branch {
   id   Int     @id @default(autoincrement())
@@ -309,16 +309,16 @@ head -30 prisma/migrations/0_init/migration.sql
 
 `migrate diff --from-empty --to-schema` печатает SQL, который **создал бы** всё, что описано в схеме, «с пустого места». Мы сохраняем его как нулевую миграцию (префикс `0_` нужен, чтобы она шла первой в алфавитном порядке).
 
-**Важная ловушка.** В схеме нет модели для `tbl_DepositLog` (`@@ignore`), поэтому в `0_init` её **нет**. А история миграций должна быть **полной**: Prisma проверяет изменения на временной «теневой» (shadow) базе, которую создаёт, **проигрывая историю с нуля** — и если в истории таблицы нет, а следующая миграция (шаг 3.6) будет её менять, проигрывание упадёт. Допишем недостающую таблицу в `0_init` **руками** (документация прямо разрешает править начальную миграцию для того, чего схема не описывает):
+**Проверим, что в нулевой миграции есть и журнал залогов.** Модель `tbl_DepositLog` помечена `@@ignore` — клиент её не видит, но для **миграций** она по-прежнему часть схемы, и `migrate diff` включил её в SQL (`CREATE TABLE "tbl_DepositLog"` идёт в начале вывода). Это важно: история миграций должна быть **полной**. Prisma проверяет изменения на временной «теневой» (shadow) базе, **проигрывая историю с нуля**, и если бы таблицы в истории не было, а следующая миграция (шаг 3.6) её меняет, проигрывание упало бы.
 
-```sql
--- prisma/migrations/0_init/migration.sql — дописать в конец
-CREATE TABLE "tbl_DepositLog" (
-    "booking_id" INTEGER,
-    "delta" DOUBLE PRECISION,
-    "ts" BIGINT,
-    "reason" TEXT
-);
+```bash run
+cd ~/prisma-lab/rentkit
+grep -c 'CREATE TABLE' prisma/migrations/0_init/migration.sql
+grep -n 'tbl_DepositLog' prisma/migrations/0_init/migration.sql
+```
+
+### result
+```out auto
 ```
 
 Теперь отметим baseline как **уже применённый** (в базе всё уже есть) и проверим статус:
@@ -351,7 +351,7 @@ psqlr -c 'SELECT migration_name, finished_at IS NOT NULL AS applied FROM _prisma
 ### quiz
 - Что делает baseline и почему без него `migrate dev` ломает унаследованную базу?
 - Чем `migrate resolve --applied` отличается от `migrate deploy`?
-- Почему в `0_init` пришлось вручную дописать `tbl_DepositLog`?
+- Почему `tbl_DepositLog` есть в `0_init`, хотя клиент её «не видит» (`@@ignore`)?
 
 ### links
 - https://www.prisma.io/docs/orm/v7/prisma-migrate/workflows/baselining | baselining | Prisma 7: Baselining a database
@@ -411,7 +411,7 @@ import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 
 const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL! }) })
-console.log(Object.keys(prisma).filter((k) => !k.startsWith('$') && !k.startsWith('_')))
+console.log(Object.keys(prisma).filter((k) => k !== 'constructor' && !k.startsWith('$') && !k.startsWith('_')))
 await prisma.$disconnect()
 EOF
 npx tsx src/intro/08-depositlog.ts
@@ -457,9 +457,9 @@ npx prisma db pull --print | grep -A12 'tbl_DepositLog'
 ```out auto
 ```
 
-Добавь в `schema.prisma` модель (переименованную, с `@@map`):
+В выводе `db pull --print` модель `tbl_DepositLog` уже **без** `@@ignore` (с колонкой `id`), а внутри неё Prisma оставила комментарий `// *** WARNING ***` — она напоминает, что имена `Booking`, `Branch` и остальных взяты из твоих `@@map`. Это нормально. Теперь замени `@@ignore`-модель в `schema.prisma` на переименованную, с `@@map` (старое определение `tbl_DepositLog` при этом уходит):
 
-```prisma
+```prisma schema
 model DepositLog {
   id         Int     @id @default(autoincrement())
   booking_id Int?
@@ -476,10 +476,10 @@ model DepositLog {
 **Приёмка сессии:** `migrate status` — `Database schema is up to date!` с двумя миграциями (`0_init`, `…_depositlog_pk`); `prisma generate` проходит; у клиента пять+одна модель, включая `depositLog`; в `NOTES.md` — полный список болячек с цифрами из шага 3.1.
 
 ### why
-Эта история учит сразу двум вещам. **Первая:** Prisma ничего не делает с таблицей без идентификатора — молча. Об этом нужно знать, иначе «пропавшие» данные ищут часами. **Вторая:** миграции — это **полная** история, которую можно проиграть с нуля; поэтому важно было дописать `tbl_DepositLog` в `0_init`, иначе вторая миграция на чистой базе (в CI или у коллеги) упала бы.
+Эта история учит сразу двум вещам. **Первая:** Prisma ничего не делает с таблицей без идентификатора — молча. Об этом нужно знать, иначе «пропавшие» данные ищут часами. **Вторая:** миграции — это **полная** история, которую можно проиграть с нуля; поэтому важно, что `tbl_DepositLog` попала в `0_init` (`@@ignore` на миграции не влияет): иначе вторая миграция на чистой базе (в CI или у коллеги) упала бы.
 
 ### deep Если не получилось
-- **`P3006: Migration failed to apply cleanly to the shadow database`** — проигрывание истории на пустой базе упало: чаще всего в `0_init` не хватает таблицы (см. шаг 3.4) или порядок папок не тот.
+- **`P3006: Migration failed to apply cleanly to the shadow database`** — проигрывание истории на пустой базе упало: чаще всего в `0_init` не хватает таблицы (проверь `grep` из шага 3.4) или порядок папок не тот.
 - **`ERROR: column "id" of relation … already exists`** — миграция применена вручную раньше (прямо через `psql`); тогда база и история разошлись (**drift**, разберём в 11.5). Отметь её применённой: `npx prisma migrate resolve --applied 20261020100000_depositlog_pk`.
 - **`deploy` не видит новую папку** — в имени должен быть `migration.sql` строго с таким названием.
 

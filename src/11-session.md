@@ -37,10 +37,16 @@ SQL
 ```out auto
 ```
 
-Ожидаем: около полутора тысяч броней без клиента, около девятисот без предмета, платежей и залогов-сирот нет, а у большинства броней-сирот **платежи есть** — значит, удалять их нельзя. Решение (его принимает человек, мы его **записываем**): создадим служебные записи «Неизвестный клиент» и «Неизвестный предмет», привяжем сирот к ним, а исходные значения сохраним в журнале. Миграция:
+Ожидаем: около полутора тысяч броней без клиента, около девятисот без предмета, платежей и залогов-сирот нет, а у большинства броней-сирот **платежи есть** — значит, удалять их нельзя. Решение (его принимает человек, мы его **записываем**): для клиентов создадим служебную запись «Неизвестный клиент» и привяжем к ней сирот, а для предметов поставим **пустое значение** (`NULL`), исходные значения сохраним в журнале. Почему не «Неизвестный предмет» по аналогии? Девятьсот броней на одном выдуманном предмете оказались бы «заняты» им одновременно и породили бы сотни ложных двойных броней — это мы увидим в сессии 13, когда сделаем проверку занятости (проверено: такой «предмет» дал 673 лишних пересечения из 806). Клиенту «много броней сразу» не вредит, предмету — вредит. Миграция:
 
-```sql
--- prisma/migrations/20261020150000_orphans_to_unknown/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name orphans_to_unknown`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name orphans_to_unknown && sleep 1
+```
+
+```sql into=prisma/migrations/*_orphans_to_unknown/migration.sql
+-- prisma/migrations/<метка>_orphans_to_unknown/migration.sql
 CREATE TABLE "orphan_log" (
     "booking_id"  INTEGER PRIMARY KEY,
     "old_cust_id" INTEGER,
@@ -48,9 +54,8 @@ CREATE TABLE "orphan_log" (
     "fixed_at"    TIMESTAMPTZ(3) NOT NULL DEFAULT now()
 );
 
--- служебные записи без привязки к филиалу (branch_id = NULL): тогда миграция проигрывается и на пустой базе (шаг 18.3)
+-- служебная запись без привязки к филиалу (branch_id = NULL): тогда миграция проигрывается и на пустой базе (шаг 18.3)
 INSERT INTO "tbl_Customers" ("CustName", branch_id, created_at) VALUES ('Неизвестный клиент (архив)', NULL, now());
-INSERT INTO "tbl_Items" (sku, title, category, branch_id, active) VALUES ('SKU-UNKNOWN', 'Неизвестный предмет (архив)', 'Прочее', NULL, 0);
 
 INSERT INTO "orphan_log" (booking_id, old_cust_id, old_item_id)
 SELECT b.id,
@@ -63,13 +68,13 @@ WHERE (b.cust_id IS NOT NULL AND c.id IS NULL) OR (b.item_id IS NOT NULL AND i.i
 
 UPDATE "tbl_Bookings" b SET cust_id = (SELECT id FROM "tbl_Customers" WHERE "CustName" = 'Неизвестный клиент (архив)')
 WHERE b.id IN (SELECT booking_id FROM "orphan_log" WHERE old_cust_id IS NOT NULL);
-UPDATE "tbl_Bookings" b SET item_id = (SELECT id FROM "tbl_Items" WHERE sku = 'SKU-UNKNOWN')
+UPDATE "tbl_Bookings" b SET item_id = NULL
 WHERE b.id IN (SELECT booking_id FROM "orphan_log" WHERE old_item_id IS NOT NULL);
 ```
 
-Добавь в схему модель для журнала (чтобы Prisma не считала таблицу «лишней»), создай миграцию и перепроверь:
+Добавь в схему модель для журнала (чтобы Prisma не считала таблицу «лишней»), примени миграцию и перепроверь:
 
-```prisma
+```prisma schema
 model OrphanLog {
   bookingId Int      @id @map("booking_id")
   oldCustId Int?     @map("old_cust_id")
@@ -81,8 +86,6 @@ model OrphanLog {
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npx prisma migrate dev --create-only --name orphans_to_unknown
-# замени сгенерированный migration.sql на SQL выше (там только CREATE TABLE orphan_log) и допиши в конец остальное
 npx prisma migrate dev
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
 psqlr -c 'SELECT count(*) AS сирот_после FROM "tbl_Bookings" b LEFT JOIN "tbl_Customers" c ON c.id = b.cust_id LEFT JOIN "tbl_Items" i ON i.id = b.item_id WHERE (b.cust_id IS NOT NULL AND c.id IS NULL) OR (b.item_id IS NOT NULL AND i.id IS NULL)'
@@ -124,8 +127,14 @@ psqlr -c 'SELECT count(*) AS в_журнале FROM orphan_log'
 
 Сироты закончились (11.1). Теперь ключи. Первая миграция — «мягкая» (`NOT VALID`):
 
-```sql
--- prisma/migrations/20261020160000_fk_not_valid/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name fk_not_valid`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name fk_not_valid && sleep 1
+```
+
+```sql into=prisma/migrations/*_fk_not_valid/migration.sql
+-- prisma/migrations/<метка>_fk_not_valid/migration.sql
 ALTER TABLE "tbl_Bookings" ADD CONSTRAINT "tbl_Bookings_cust_id_fkey"   FOREIGN KEY ("cust_id")   REFERENCES "tbl_Customers"("id") ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
 ALTER TABLE "tbl_Bookings" ADD CONSTRAINT "tbl_Bookings_item_id_fkey"   FOREIGN KEY ("item_id")   REFERENCES "tbl_Items"("id")     ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
 ALTER TABLE "tbl_Bookings" ADD CONSTRAINT "tbl_Bookings_branch_id_fkey" FOREIGN KEY ("branch_id") REFERENCES "tbl_Branches"("id")  ON DELETE SET NULL ON UPDATE CASCADE NOT VALID;
@@ -138,8 +147,14 @@ ALTER TABLE "tbl_DepositLog" ADD CONSTRAINT "tbl_DepositLog_booking_id_fkey" FOR
 
 Имена ключей `<таблица>_<колонка>_fkey` совпадают с теми, что дала бы Prisma, — поэтому она потом признает их своими. Вторая миграция — проверка уже существующих строк (отдельным файлом, чтобы её можно было запустить в удобное время):
 
-```sql
--- prisma/migrations/20261020160100_fk_validate/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name fk_validate`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name fk_validate && sleep 1
+```
+
+```sql into=prisma/migrations/*_fk_validate/migration.sql
+-- prisma/migrations/<метка>_fk_validate/migration.sql
 ALTER TABLE "tbl_Bookings"   VALIDATE CONSTRAINT "tbl_Bookings_cust_id_fkey";
 ALTER TABLE "tbl_Bookings"   VALIDATE CONSTRAINT "tbl_Bookings_item_id_fkey";
 ALTER TABLE "tbl_Bookings"   VALIDATE CONSTRAINT "tbl_Bookings_branch_id_fkey";
@@ -151,11 +166,13 @@ ALTER TABLE "tbl_DepositLog" VALIDATE CONSTRAINT "tbl_DepositLog_booking_id_fkey
 
 Теперь схема: убираем `relationMode = "prisma"` (по умолчанию связи — настоящие ключи) и уточняем `onDelete` у денег:
 
-```prisma
+```prisma schema
 datasource db {
   provider = "postgresql"
 }
+```
 
+```prisma
 model Payment {
   // …
   booking Booking? @relation(fields: [bookingId], references: [id], onDelete: Restrict)
@@ -166,20 +183,24 @@ model DepositLog {
 }
 ```
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && sed -i -E 's/(booking +Booking\? +@relation\(fields: \[bookingId\], references: \[id\])\)/\1, onDelete: Restrict)/' prisma/schema.prisma
+```
+
 ```bash run
 cd ~/prisma-lab/rentkit
-mkdir -p prisma/migrations/20261020160000_fk_not_valid prisma/migrations/20261020160100_fk_validate
-# создай оба migration.sql с содержимым выше, затем:
 npx prisma migrate deploy
 npx prisma migrate dev --create-only --name should_be_empty_fk
-npx prisma generate
+cat prisma/migrations/*_should_be_empty_fk/migration.sql
+rm -r prisma/migrations/*_should_be_empty_fk
+npm run generate
 ```
 
 ### result
 ```out auto
 ```
 
-Ожидаем: обе миграции применены; `migrate dev --create-only` сообщает «Already in sync» (Prisma узнала твои ключи: **сверьтесь**, а если она захочет пересоздать ключи — сравни имена и `ON DELETE/UPDATE` с тем, что генерирует Prisma). Проверим, что ключи **работают** и что теперь возможен код `P2003`:
+Ожидаем: обе миграции применены, а черновик `should_be_empty_fk` пуст (Prisma узнала твои ключи; если в нём появились `DROP CONSTRAINT`/`ADD CONSTRAINT` — сравни имена и `ON DELETE/UPDATE` с тем, что генерирует Prisma). Проверим, что ключи **работают** и что теперь возможен код `P2003`:
 
 ```ts
 // src/lessons/11-fk.ts
@@ -190,7 +211,7 @@ import { prisma } from '../db.js'
 try {
   await prisma.$executeRaw`INSERT INTO "tbl_Bookings" (cust_id, status) VALUES (999999999, 'DRAFT')`
 } catch (e) {
-  console.log('вставка сироты:', (e as Error).message.split('\n')[0])
+  console.log('вставка сироты:', (e as Error).message.trim().split('\n').filter(Boolean).at(-1))
 }
 
 // 2. попытка удалить бронь с платежами: RESTRICT → P2003
@@ -242,8 +263,14 @@ npx tsx src/lessons/11-fk.ts
 
 **Дубли платежей.** В шаге 3.1 мы нашли около трёх тысяч повторных `ext_ref`. Это ретраи шлюза: деньги пришли один раз, строка записана дважды. Решение — оставить **первую** запись, остальные убрать с **журналом**:
 
-```sql
--- prisma/migrations/20261020170000_payments_dedupe/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name payments_dedupe`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name payments_dedupe && sleep 1
+```
+
+```sql into=prisma/migrations/*_payments_dedupe/migration.sql
+-- prisma/migrations/<метка>_payments_dedupe/migration.sql
 CREATE TABLE "payment_dup_log" AS
 SELECT p.*, now() AS removed_at
 FROM "tbl_Payments" p
@@ -258,8 +285,14 @@ USING "payment_dup_log" l WHERE p.id = l.id;
 
 Затем сами ограничения — **в виде `CHECK … NOT VALID` и `UNIQUE`**:
 
-```sql
--- prisma/migrations/20261020170100_constraints/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name constraints`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name constraints && sleep 1
+```
+
+```sql into=prisma/migrations/*_constraints/migration.sql
+-- prisma/migrations/<метка>_constraints/migration.sql
 
 -- конец брони строго позже начала; сумма и залог не отрицательны
 ALTER TABLE "tbl_Bookings" ADD CONSTRAINT bookings_period_ck CHECK (ends_at > starts_at) NOT VALID;
@@ -283,10 +316,64 @@ CREATE UNIQUE INDEX "tbl_Payments_ext_ref_key" ON "tbl_Payments"("ext_ref");
 
 И в схеме: обязательные поля (`startsAt DateTime`, `endsAt DateTime`, `status BookingStatus`, у платежа `amount Decimal`, `paidAt DateTime`), `@unique` на `extRef` у платежа, а `CHECK` Prisma не описывает (они живут только в SQL, **сверьтесь**: Prisma пропускает check-ограничения при сравнении).
 
+```prisma schema hidden
+model Booking {
+  id         Int            @id @default(autoincrement())
+  customerId Int?           @map("cust_id")
+  itemId     Int?           @map("item_id")
+  branchId   Int?           @map("branch_id")
+  startsAt   DateTime       @map("starts_at") @db.Timestamptz(3)
+  endsAt     DateTime       @map("ends_at") @db.Timestamptz(3)
+  total      Decimal?       @db.Decimal(12, 2)
+  deposit    Decimal?       @db.Decimal(12, 2)
+  status     BookingStatus
+  note       String?
+
+  customer   Customer?    @relation(fields: [customerId], references: [id])
+  item       Item?        @relation(fields: [itemId], references: [id])
+  branch     Branch?      @relation(fields: [branchId], references: [id])
+  payments   Payment[]
+  depositLog DepositLog[]
+
+  @@index([customerId])
+  @@index([itemId])
+  @@index([branchId])
+  @@index([branchId, status, id(sort: Desc)], name: "bookings_branch_status_id")
+  @@map("tbl_Bookings")
+}
+
+model Payment {
+  id        Int      @id @default(autoincrement())
+  bookingId Int?     @map("booking_id")
+  amount    Decimal  @db.Decimal(12, 2)
+  paidAt    DateTime @map("paid_at") @db.Timestamptz(3)
+  kind      Int?     @db.SmallInt
+  extRef    String?  @unique @map("ext_ref")
+
+  booking Booking? @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  @@index([bookingId])
+  @@map("tbl_Payments")
+}
+
+model PaymentDupLog {
+  id        Int?
+  bookingId Int?      @map("booking_id")
+  amount    Decimal?  @db.Decimal(12, 2)
+  paidAt    DateTime? @map("paid_at") @db.Timestamptz(3)
+  kind      Int?      @db.SmallInt
+  extRef    String?   @map("ext_ref")
+  removedAt DateTime? @map("removed_at") @db.Timestamptz(6)
+
+  @@map("payment_dup_log")
+  @@ignore
+}
+```
+
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate deploy
-npx prisma generate
+npm run generate
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr "SELECT conname, convalidated FROM pg_constraint WHERE conrelid = '\"tbl_Bookings\"'::regclass AND contype IN ('c','f') ORDER BY 1"
 psqlr "SELECT count(*) AS дублей_ext_ref FROM (SELECT ext_ref FROM \"tbl_Payments\" GROUP BY 1 HAVING count(*) > 1) t"
@@ -325,8 +412,14 @@ psqlr "SELECT count(*) AS дублей_ext_ref FROM (SELECT ext_ref FROM \"tbl_P
 
 **Шаг 1 — нормализованный телефон** (генерируемая колонка: база сама считает «последние 10 цифр»):
 
-```sql
--- prisma/migrations/20261020180000_customer_phone_norm/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name customer_phone_norm`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name customer_phone_norm && sleep 1
+```
+
+```sql into=prisma/migrations/*_customer_phone_norm/migration.sql
+-- prisma/migrations/<метка>_customer_phone_norm/migration.sql
 ALTER TABLE "tbl_Customers" ADD COLUMN "phone_norm" TEXT
   GENERATED ALWAYS AS (right(regexp_replace("phone", '\D', '', 'g'), 10)) STORED;
 
@@ -337,7 +430,22 @@ CREATE TABLE "customer_merge_log" (
 );
 ```
 
-В схему: `phoneNorm String? @map("phone_norm")` у `Customer` (читаем, но **никогда не пишем** — колонка генерируется базой) и модель `CustomerMergeLog` (по образцу `OrphanLog`). **Сверьтесь**: как Prisma 7 относится к генерируемой колонке — по документации `@default(dbgenerated())` на поле иногда нужно, чтобы клиент не пытался её записать.
+```prisma schema
+model Customer {
+  // …поля как раньше…
+  phoneNorm String? @default(dbgenerated()) @map("phone_norm")
+}
+
+model CustomerMergeLog {
+  dupId    Int      @id @map("dup_id")
+  masterId Int      @map("master_id")
+  mergedAt DateTime @default(now()) @map("merged_at") @db.Timestamptz(3)
+
+  @@map("customer_merge_log")
+}
+```
+
+В схему — поле `phoneNorm` у `Customer` и модель `CustomerMergeLog` (по образцу `OrphanLog`), как в блоке выше. Обрати внимание на **`@default(dbgenerated())`** у `phoneNorm`: Prisma не умеет описывать генерируемые колонки, а без этой пометки она считает, что у колонки есть «значение по умолчанию, которого нет в схеме», и в **каждую** следующую миграцию дописывает `ALTER COLUMN "phone_norm" DROP DEFAULT` — а PostgreSQL на генерируемой колонке отвечает ошибкой `column "phone_norm" … is a generated column`, и миграция падает уже на shadow-базе (проверено). Пустое `dbgenerated()` говорит Prisma: «значение по умолчанию задаёт база, не трогай». Поле читай сколько угодно, но **никогда не пиши** — колонку считает база.
 
 **Шаг 2 — найти кластеры** (перед слиянием — посмотри глазами):
 
@@ -412,12 +520,18 @@ SQL
 
 Критерии: дублей после — **ноль**; брони без клиента — **ноль** (внешний ключ из 11.2 не дал бы удалить клиента, у которого остались брони — `ON DELETE SET NULL` обнулил бы ссылки, поэтому порядок `UPDATE → DELETE` важен); число клиентов уменьшилось на размер журнала. **Шаг 4 — уникальность**: теперь телефон можно сделать уникальным:
 
-```sql
--- prisma/migrations/20261020180100_customer_phone_unique/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name customer_phone_unique`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name customer_phone_unique && sleep 1
+```
+
+```sql into=prisma/migrations/*_customer_phone_unique/migration.sql
+-- prisma/migrations/<метка>_customer_phone_unique/migration.sql
 CREATE UNIQUE INDEX "tbl_Customers_phone_norm_key" ON "tbl_Customers"("phone_norm") WHERE "phone_norm" <> '';
 ```
 
-(В схеме Prisma частичный уникальный индекс не выражается — оставь миграцию SQL-ной, **сверьтесь**, что `migrate dev --create-only` её не пытается удалить, как в шаге 8.5.) Гонку «проверить, потом создать» из 7.7 закрывает именно этот индекс: теперь второй одновременный `create` получит `P2002`.
+(В схеме Prisma частичный уникальный индекс не выражается — оставь миграцию SQL-ной; частичные индексы Prisma, как мы видели в 8.5, не удаляет.) Гонку «проверить, потом создать» из 7.7 закрывает именно этот индекс: теперь второй одновременный `create` получит `P2002`.
 
 ### why
 Слияние дублей — классическая «задача на аккуратность»: легко удалить лишнее, трудно потом восстановить. Единая транзакция гарантирует, что мы не останемся в промежуточном состоянии, а журнал — что можно ответить «кто был кем». Нормализованный телефон, посчитанный **базой** (generated column), надёжнее, чем нормализация в коде: она работает для любого, кто пишет в таблицу.
@@ -469,6 +583,19 @@ echo n | npx prisma migrate dev --name probe 2>&1 | head -20
 2. **Зафиксировать правку миграцией** — если изменение нужное: опиши его в схеме (`manager String?`), создай миграцию **с тем же SQL** (`migrate dev --create-only`, проверь SQL), а так как в базе колонка уже есть, пометь миграцию **применённой**: `npx prisma migrate resolve --applied <имя>`.
 3. **Пересоздать базу** — только для **разработческой** базы, где данных не жалко, и только когда тебе всё равно (`migrate reset`).
 
+Выберем первый выход — правка была ошибочной, откатываем её и проверяем, что Prisma снова довольна:
+
+```bash run
+cd ~/prisma-lab/rentkit
+psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
+psqlr -c 'ALTER TABLE "tbl_Branches" DROP COLUMN manager'
+npx prisma migrate status
+```
+
+### result
+```out auto
+```
+
 Сделай выход №1 и проверь:
 
 ```bash run
@@ -511,13 +638,15 @@ Drift — самое частое «непонятное» сообщение Pr
 Двое одновременно ремонтируют дом, каждый пишет свой журнал изменений. Потом журналы нужно слить в один. Если один убрал стену, а другой на ней повесил полку — журналы расходятся, и сливать надо руками, с головой. С миграциями то же: две ветки добавляют миграции, и итоговая **история должна применяться по порядку без противоречий**.
 :::
 
-Смоделируем: две «ветки» (две папки миграций с разными временами), обе трогают таблицу филиалов.
+Смоделируем: две «ветки» (две папки миграций с разными временами), обе трогают таблицу филиалов. (Сначала `--create-only` создаёт папку с настоящей меткой времени, потом мы пишем в неё SQL.)
 
 ```bash run
 cd ~/prisma-lab/rentkit
-mkdir -p prisma/migrations/20261021090000_branch_phone prisma/migrations/20261021095000_branch_email
-echo 'ALTER TABLE "tbl_Branches" ADD COLUMN "phone" TEXT;' > prisma/migrations/20261021090000_branch_phone/migration.sql
-echo 'ALTER TABLE "tbl_Branches" ADD COLUMN "email" TEXT;' > prisma/migrations/20261021095000_branch_email/migration.sql
+npx prisma migrate dev --create-only --name branch_phone
+echo 'ALTER TABLE "tbl_Branches" ADD COLUMN "phone" TEXT;' > prisma/migrations/*_branch_phone/migration.sql
+sleep 1
+npx prisma migrate dev --create-only --name branch_email
+echo 'ALTER TABLE "tbl_Branches" ADD COLUMN "email" TEXT;' > prisma/migrations/*_branch_email/migration.sql
 npx prisma migrate deploy
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr '\d "tbl_Branches"'
@@ -548,7 +677,15 @@ cat prisma/migrations/migration_lock.toml
 ```out auto
 ```
 
-Колонки `phone` и `email` в `tbl_Branches` оставь: в сессиях 12–19 они не используются, но убирать применённые миграции нельзя; если очень хочется убрать — создай новую миграцию `DROP COLUMN`.
+Колонки `phone` и `email` в `tbl_Branches` оставь: в сессиях 12–19 они не используются, но убирать применённые миграции нельзя; если очень хочется убрать — создай новую миграцию `DROP COLUMN`. Чтобы следующая автоматическая миграция не предложила их удалить, опиши их и в схеме:
+
+```prisma schema
+model Branch {
+  // …поля как раньше…
+  phone String?
+  email String?
+}
+```
 
 ### why
 В одиночной работе миграции — просто список. В команде они — общий журнал, и от дисциплины зависит, соберётся ли он в одну историю. Правило «`dev` у себя, `deploy` везде» плюс «не правим применённое» — минимум, который спасает от большинства командных инцидентов.
@@ -586,6 +723,10 @@ echo n | npx prisma migrate dev --name probe 2>&1 | head -14
 
 ### result
 ```out auto
+```
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && f=$(ls -d prisma/migrations/*_depositlog_pk | head -1)/migration.sql && cp /tmp/migration.sql.bak "$f"
 ```
 
 Сообщение скажет, что миграция `…_depositlog_pk` **изменена после применения** (контрольная сумма в `_prisma_migrations` не совпадает с файлом) и предложит сбросить базу. **Твоя задача:** (1) ответить на вопрос «а что случилось?» — в одной фразе, своими словами; (2) вернуть файл в исходный вид (`cp /tmp/migration.sql.bak "$f"`) и убедиться, что `migrate status` чист; (3) придумать, **как бы ты внесла эту правку правильно**, если бы комментарий был важной корректировкой (подсказка — в «Если не получилось»).

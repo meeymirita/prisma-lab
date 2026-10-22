@@ -6,7 +6,7 @@
 | версия (проверь, что `7.x`) | `npx prisma --version` |
 | проверить и отформатировать схему | `npx prisma validate`, `npx prisma format` |
 | прочитать базу в схему | `npx prisma db pull` (`--print` — без записи) |
-| создать клиент | `npx prisma generate` (с TypedSQL — `--sql`) — **вручную** после каждой правки схемы |
+| создать клиент | `npx prisma generate` — **вручную** после каждой правки схемы; с TypedSQL — всегда `npx prisma generate --sql` (в лабе — `npm run generate`): обычный `generate` стирает `sql.ts` |
 | миграция в разработке | `npx prisma migrate dev --name имя` (`--create-only` — только создать, не применять) |
 | применить миграции (CI, прод) | `npx prisma migrate deploy` |
 | состояние истории | `npx prisma migrate status` |

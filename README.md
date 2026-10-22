@@ -2,7 +2,7 @@
 
 Лаба по Prisma ORM 7 на сквозном проекте **«Прокат снаряжения» (RentKit)**: вам достаётся чужая рабочая база с грязными данными, без внешних ключей, с дублями и датами в трёх форматах, и её нужно превратить в типизированный слой данных на Prisma + TypeScript, не останавливая «прод». Внутри — линии «деньги» (ledger, идемпотентность, `Decimal`) и «мультитенантность» (филиалы, RLS, client extensions).
 
-**Статус: ⬜ написана 20.10.2026 (19 сессий, 126 шагов, ~76 ч); ничего не запускалось: в «Ожидаемом результате» пометка «вывод не получен», построчной вычитки нет; дамп базы сгенерирован и проверен восстановлением (20.10.2026), блоки лабы не запускались. Список сомнительных мест — в [fixes/backend/prisma.md](https://github.com/meeymirita/lab-fixes/blob/main/backend/prisma.md); план — [`prisma_lab_plan.md`](prisma_lab_plan.md).**
+**Статус: 🟡 написана 20.10.2026 (19 сессий, 126 шагов, ~76 ч); 22.10.2026 прогнана целиком в Docker (PostgreSQL 18.6, Node 24, Prisma 7.10.1, TypeScript 6.0, Vitest 5): все блоки выполнены по порядку с чистой базы из дампа, 119 блоков «Ожидаемого результата» — настоящий вывод; найдено и исправлено около сорока расхождений. Решения заданий 🔨 (кроме 6.7), PgBouncer, GitHub Actions и сборка образа целиком не проверялись. Подробности — [fixes/backend/prisma.md](https://github.com/meeymirita/lab-fixes/blob/main/backend/prisma.md); план — [`prisma_lab_plan.md`](prisma_lab_plan.md).**
 
 ## Что по плану
 
@@ -26,7 +26,4 @@
 
 ## Что дальше
 
-Прогон в Docker (PostgreSQL 18 и Node 24): выполнить блоки сессий, подставить настоящий вывод (`tools/build-manual.py prisma --run` потребует runner), исправить расхождения, вычитать построчно.
-
-## Лицензия и авторство
-Код — MIT, тексты — CC BY 4.0, см. `LICENSE` и `NOTICE`.
+Повторить прогон: `RESET=1 python3 tools/build-manual.py prisma --run --allow-missing` из корня родительского репозитория (нужен Docker; образ — `prisma/Dockerfile`, режим Docker-в-Docker — `prisma/src/run.json`; блоки `ts … file=` записывают файлы шагов, `schema` вносит модели в `schema.prisma` через `tools/schema-merge.mjs`).

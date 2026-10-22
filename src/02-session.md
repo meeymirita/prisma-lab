@@ -366,6 +366,10 @@ npm run typecheck 2>&1 | head -20
 
 Разбор: (1) `b.note` может быть `undefined` — нужно либо проверить (`if (b.note) …`), либо дать значение по умолчанию (`shout(b.note ?? '')`); (2) элемента с индексом 5 нет, и TS (с `noUncheckedIndexedAccess`) честно считает результат `number | undefined` — проверь длину или используй `?.`; (3) опечатка в имени поля: `startsAt`, не `startAt` — подсказка редактора её бы поймала. Исправь все три и убедись, что `npm run typecheck` чистый.
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && sed -i 's/shout(b.note)/shout(b.note ?? "")/; s/ids\[5\].toFixed(2)/ids[5]?.toFixed(2)/; s/full.startAt/full.startsAt/' src/intro/07-errors.ts
+```
+
 **Приёмка сессии:** все файлы в `src/intro/` проходят `npm run typecheck`; ты можешь объяснить, чем `tsx` отличается от `tsc`, что значит `T | null`, и написать функцию с `async`/`await` и обработкой ошибок через `instanceof Error`.
 
 ### why

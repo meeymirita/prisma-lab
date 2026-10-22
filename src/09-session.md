@@ -179,7 +179,7 @@ SQL_LOG=1 npx tsx src/lessons/09-injection.ts 2>&1 | grep -v '^  params' | tail 
 ```out auto
 ```
 
-Ожидаем: в «плохой» версии `OR '1'='1'` превращается в часть условия — вернулись **строки** (а в реальной системе — все клиенты, включая чужих); в «хорошей» — 0 строк: строка `x' OR '1'='1` ищется как **имя**. Второй пример показывает, что инъекция может **выполнять произвольные команды** (в PostgreSQL через простой `query` несколько команд через `;` — разрешены; **сверьтесь** с поведением драйвера: может вернуть ошибку «cannot insert multiple commands», тогда атака ограничена одной командой — но первой всё равно достаточно).
+Ожидаем: в «плохой» версии `OR '1'='1'` превращается в часть условия — вернулись **строки** (а в реальной системе — все клиенты, включая чужих); в «хорошей» — 0 строк: строка `x' OR '1'='1` ищется как **имя**. Второй пример показывает, что инъекция может **выполнять произвольные команды**: вторая команда (`pg_sleep(2)`) **отработала** — `unsafe sleep` занял ≈2 секунды, а потом `$queryRawUnsafe` споткнулся об устройство ответа (`Cannot read properties of undefined (reading 'map')`). Ошибка в консоли не значит, что атака не удалась: команда уже выполнена. На месте `pg_sleep` мог стоять `DROP TABLE` или `UPDATE`.
 
 Взгляни в лог: у безопасной версии запрос с `$1`, у небезопасной — **готовый текст со вклеенной строкой**. Поэтому правило, которое не нарушают: **значения — только параметры.** Если нужно подставить **имя колонки или направление сортировки**, делается это иначе — через белый список (шаг 9.4).
 
@@ -191,7 +191,7 @@ SQL-инъекция живёт в списках самых частых уяз
 
 ### deep Если не получилось
 - **Обе версии возвращают 0 строк** — проверь, что `attack` содержит апостроф `'`, и что в базе есть клиенты (`SELECT count(*) FROM "tbl_Customers"`).
-- **`$queryRawUnsafe` вернул ошибку синтаксиса** — кавычки в `attack` перекрыли экранирование: подберите иной вариант (`x' OR 1=1 --`).
+- **Вторая атака не «спит» две секунды** — драйвер или версия вернули ошибку раньше выполнения; воспроизведи первую атаку (она надёжнее) и посмотри в лог.
 
 ### quiz
 - Почему параметр защищает от инъекции, а склейка строки — нет?
@@ -280,7 +280,7 @@ npm run typecheck
 
 В Prisma 7 TypedSQL — **предпросмотровая** возможность (**сверьтесь**: статус в вашей версии). Включаем:
 
-```prisma
+```prisma schema
 generator client {
   provider        = "prisma-client"
   output          = "../src/generated/prisma"
@@ -308,7 +308,7 @@ LIMIT $2
 ```ts
 // src/lessons/09-typedsql.ts
 import { prisma } from '../db.js'
-import { topCustomers } from '../generated/prisma/sql/index.js'
+import { topCustomers } from '../generated/prisma/sql.js'
 
 const rows = await prisma.$queryRawTyped(topCustomers(1, 5))
 for (const r of rows) console.log(r.customerId, r.bookings, r.revenue.toFixed(2))   // типы выведены из базы!
@@ -318,7 +318,7 @@ await prisma.$disconnect()
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma generate --sql
-ls src/generated/prisma/sql | head -3
+ls src/generated/prisma | grep sql
 npx tsx src/lessons/09-typedsql.ts
 npm run typecheck
 ```
@@ -327,9 +327,21 @@ npm run typecheck
 ```out auto
 ```
 
-`prisma generate --sql` подключается к базе, **описывает** запрос (через `PREPARE`) и генерирует функцию `topCustomers(branchId, limit)` с типами `{ customerId: number | null; bookings: bigint; revenue: Prisma.Decimal | null }` (**точные типы смотри в подсказках редактора**). Параметры тоже типизированы: передашь строку вместо числа — ошибка компиляции. Если запрос неверен (нет таблицы, опечатка в колонке), **`generate --sql` упадёт** — ошибка обнаружена на этапе сборки.
+`prisma generate --sql` подключается к базе, **описывает** запрос (через `PREPARE`) и генерирует функцию `topCustomers(branchId, limit)` с типами `{ customerId: number | null; bookings: bigint | null; revenue: Decimal | null }` (`null` везде, потому что агрегат над пустой группой может вернуть `NULL`). Параметры тоже типизированы: передашь строку вместо числа — ошибка компиляции. Если запрос неверен (нет таблицы, опечатка в колонке), **`generate --sql` упадёт** — ошибка обнаружена на этапе сборки.
 
-Условия: миграции должны быть **применены** до генерации (запрос проверяется на настоящей базе); имя файла `.sql` — идентификатор; расположение папки можно менять через `typedSql: { path }` в `prisma.config.ts`. Импорт — из папки `sql` рядом с клиентом (**сверьтесь** с путём в вашей версии; документация v7 показывает `./generated/prisma/sql`).
+Условия: миграции должны быть **применены** до генерации (запрос проверяется на настоящей базе); имя файла `.sql` — идентификатор; расположение папки можно менять через `typedSql: { path }` в `prisma.config.ts`. Импорт — из файла `sql.ts` рядом с клиентом (`../generated/prisma/sql.js`; рядом лежит папка `sql/` с файлом на каждый запрос). Путь проверен на Prisma 7.10: с генератором `prisma-client` индекса `sql/index` нет, а `…/sql/index.js` из старых статей даёт `Cannot find module`.
+
+**Ловушка, на которой спотыкаются все.** Обычная `npx prisma generate` (без `--sql`) пересоздаёт папку клиента и **стирает `sql.ts`**: после неё любой импорт `../generated/prisma/sql.js` падает с `Cannot find module`, а `tsc` — с `TS2307`. С TypedSQL клиент надо генерировать **всегда** с флагом `--sql`. Чтобы не помнить об этом, заведём скрипт `npm run generate` (с этого шага — только он; `generate --sql` требует папку `prisma/sql`, поэтому до TypedSQL он не годился):
+
+```bash run
+cd ~/prisma-lab/rentkit
+npm pkg set scripts.generate="prisma generate --sql"
+npm run generate
+```
+
+### result
+```out auto
+```
 
 ### why
 TypedSQL — лучшее из двух миров: полный SQL и настоящие типы. Для отчётов, которые меняются редко и должны не врать, это основной способ. Минус — предпросмотровый статус (формат может поменяться) и необходимость базы при генерации — важно для CI (сессия 18).
@@ -359,7 +371,7 @@ TypedSQL — лучшее из двух миров: полный SQL и наст
 ```ts
 // src/data/reports.ts
 import { prisma } from '../db.js'
-import { topCustomers } from '../generated/prisma/sql/index.js'
+import { topCustomers } from '../generated/prisma/sql.js'
 
 // DTO — понятный наружу тип: числа и строки, ничего «специального»
 export type TopCustomer = { customerId: number; name: string | null; bookings: number; revenue: string }

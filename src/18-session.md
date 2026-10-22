@@ -53,13 +53,15 @@ export default defineConfig({
 })
 ```
 
-```ts
+```ts file=test/setup.ts
 // test/setup.ts — выполняется перед КАЖДЫМ файлом тестов, до импорта кода
 import 'dotenv/config'
 import { Client } from 'pg'
 import { afterAll } from 'vitest'
 
-const admin = process.env.DATABASE_URL!.replace(/\/[^/?]+(\?|$)/, '/postgres$1')   // подключение к служебной базе
+const swapDb = (url: string, db: string) => url.replace(/\/[^/?]+(\?|$)/, `/${db}$1`)
+
+const admin = swapDb(process.env.DATABASE_URL!, 'postgres')               // подключение к служебной базе
 const dbName = `rental_test_${process.pid}_${Date.now()}`
 
 const c = new Client({ connectionString: admin })
@@ -68,8 +70,11 @@ await c.query(`CREATE DATABASE "${dbName}" TEMPLATE rental_template`)
 await c.end()
 
 // код слоя данных (db.ts) прочитает адреса уже после этого
-process.env.DATABASE_URL = process.env.DATABASE_URL!.replace(/\/[^/?]+(\?|$)/, `/${dbName}$1`)
-if (process.env.APP_DATABASE_URL) process.env.APP_DATABASE_URL = process.env.APP_DATABASE_URL.replace(/\/[^/?]+(\?|$)/, `/${dbName}$1`)
+process.env.DATABASE_URL = swapDb(process.env.DATABASE_URL!, dbName)
+// Обычные тесты идут под владельцем базы: RLS (сессия 16) не должен мешать им готовить данные.
+// Тесты изоляции берут адрес РОЛИ ПРИЛОЖЕНИЯ отсюда и подключаются сами.
+if (process.env.APP_DATABASE_URL) process.env.APP_DATABASE_TEST_URL = swapDb(process.env.APP_DATABASE_URL, dbName)
+delete process.env.APP_DATABASE_URL
 
 afterAll(async () => {
   const { prisma } = await import('../src/db.js')
@@ -81,9 +86,11 @@ afterAll(async () => {
 })
 ```
 
+**Почему два адреса.** После сессии 16 рабочая роль `rental_app` живёт под RLS: ей нельзя даже завести тестовый предмет, пока не назван филиал (`new row violates row-level security policy`). Поэтому обычные тесты идут под **владельцем** (из окружения убран `APP_DATABASE_URL`, `db.ts` берёт `DATABASE_URL`), а тестам изоляции адрес роли приложения передан отдельно — `APP_DATABASE_TEST_URL`.
+
 Первый тест (проверяет двойную бронь — тот же инвариант, что в 13.3, но **как автоматический тест**):
 
-```ts
+```ts file=test/factories.ts
 // test/factories.ts — «фабрики» минимальных данных
 import { prisma } from '../src/db.js'
 
@@ -167,7 +174,7 @@ npx vitest run test/booking-overlap.test.ts
 
 Напиши ещё четыре тестовых файла (по образцу 18.1). Опорные точки:
 
-```ts
+```ts file=test/payments.test.ts
 // test/payments.test.ts — идемпотентность и баланс
 import { describe, expect, it } from 'vitest'
 import { recordPayment } from '../src/data/payments.js'
@@ -199,6 +206,72 @@ describe('платежи', () => {
 - **`test/soft-delete.test.ts`** — пять «боковых входов» из 15.7: каждый — отдельный `it`, **красный, пока не закрыт**.
 - **`test/ledger.test.ts`** — несбалансированная проводка отклоняется триггером; залог проходит цикл «принять → удержать → вернуть» с нулевым остатком; возврат доли не теряет копейки.
 - **`test/query-count.test.ts`** — `listBookingCards` делает **не больше трёх операций** (через расширение `timing`, шаг 15.2): защита от возврата N+1.
+
+```ts file=test/isolation.test.ts hidden
+// test/isolation.test.ts — под ролью rental_app, через scoped(...)
+import { describe, expect, it } from 'vitest'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { PrismaClient } from '../src/generated/prisma/client.js'
+
+// 1. данные готовим под владельцем
+const owner = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL! }) })
+const [b3, b7] = await Promise.all([owner.branch.create({ data: { name: 'Изоляция А', tz: 'Europe/Moscow' } }), owner.branch.create({ data: { name: 'Изоляция Б', tz: 'Europe/Moscow' } })])
+const item7 = await owner.item.create({ data: { branchId: b7.id, sku: 'ISO-' + Date.now(), title: 'Чужой предмет', active: 1 } })
+const cust7 = await owner.customer.create({ data: { branchId: b7.id, name: 'Чужой клиент', phone: '+7999' + String(Math.floor(Math.random() * 1e7)).padStart(7, '0') } })
+await owner.booking.create({ data: { branchId: b7.id, itemId: item7.id, customerId: cust7.id, status: 'CONFIRMED', startsAt: new Date('2060-01-01T00:00:00Z'), endsAt: new Date('2060-01-02T00:00:00Z') } })
+
+// 2. дальше — под ролью приложения: адрес ставим ДО первого импорта db.ts
+process.env.APP_DATABASE_URL = process.env.APP_DATABASE_TEST_URL
+const { scoped } = await import('../src/extensions/branch-scope.js')
+const A = scoped({ branchId: b3.id })
+
+describe('изоляция филиалов (под ролью rental_app)', () => {
+  it('филиал А не видит броней, клиентов и предметов филиала Б', async () => {
+    expect(await A.booking.count({ where: { branchId: b7.id } })).toBe(0)
+    expect(await A.customer.findFirst({ where: { branchId: b7.id } })).toBeNull()
+    expect(await A.item.findFirst({ where: { branchId: b7.id } })).toBeNull()
+  })
+  it('филиал А не меняет и не удаляет чужое', async () => {
+    expect((await A.booking.updateMany({ where: { branchId: b7.id }, data: { note: 'взлом' } })).count).toBe(0)
+    expect((await A.booking.deleteMany({ where: { branchId: b7.id } })).count).toBe(0)
+  })
+  it('филиал А не создаёт бронь в филиале Б (WITH CHECK)', async () => {
+    await expect(A.booking.create({ data: { branchId: b7.id, itemId: item7.id, status: 'DRAFT', startsAt: new Date('2061-01-01T00:00:00Z'), endsAt: new Date('2061-01-02T00:00:00Z') } })).rejects.toThrow()
+  })
+  it('запрос без объявленного филиала не видит ничего', async () => {
+    const { prisma } = await import('../src/db.js')                 // клиент приложения без scoped
+    expect(await prisma.booking.count()).toBe(0)
+  })
+})
+```
+
+```ts file=test/ledger.test.ts hidden
+// test/ledger.test.ts — проводки: баланс, залог, копейки
+import { describe, expect, it } from 'vitest'
+import { Prisma } from '../src/generated/prisma/client.js'
+import { prisma } from '../src/db.js'
+import { holdDeposit, settleDeposit, depositBalance } from '../src/data/deposits.js'
+import { makeBranch, makeCustomer, makeItem } from './factories.js'
+
+describe('книга проводок', () => {
+  // справочник счетов — данные миграции, а шаблонная база создана «только устройством» (pg_dump --schema-only): тесты заводят счета сами
+  const ensureAccounts = () => prisma.ledgerAccount.createMany({ data: [{ code: 'CASH', name: 'Касса' }, { code: 'REVENUE', name: 'Выручка' }, { code: 'DEPOSITS', name: 'Залоги' }], skipDuplicates: true })
+  it('одинокая «нога» проводки отклоняется при фиксации транзакции', async () => {
+    await ensureAccounts()
+    const cash = await prisma.ledgerAccount.findUniqueOrThrow({ where: { code: 'CASH' } })
+    await expect(prisma.ledgerEntry.create({ data: { txId: crypto.randomUUID(), accountId: cash.id, amount: 100 } })).rejects.toThrow(/не сбалансирована/)
+  })
+  it('залог проходит цикл «принять → удержать часть → вернуть» с нулевым остатком, копейки не теряются', async () => {
+    const b = await makeBranch(), item = await makeItem(b.id), cust = await makeCustomer(b.id)
+    await ensureAccounts()
+    const booking = await prisma.booking.create({ data: { itemId: item.id, customerId: cust.id, branchId: b.id, status: 'CONFIRMED', startsAt: new Date('2043-01-01'), endsAt: new Date('2043-01-02') } })
+    await holdDeposit(booking.id, '1000.00')
+    const r = await settleDeposit(booking.id, '333.33')
+    expect(r.kept.plus(r.returned).toFixed(2)).toBe('1000.00')
+    expect((await depositBalance(prisma, booking.id)).toFixed(2)).toBe('0.00')
+  })
+})
+```
 
 ```bash run
 cd ~/prisma-lab/rentkit
@@ -276,10 +349,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: npm }
       - run: npm ci
-      - run: npx prisma generate
       - name: Роль приложения (только для CI)
         run: psql "$DATABASE_URL" -c "CREATE ROLE rental_app LOGIN PASSWORD 'ci-only-password' NOSUPERUSER NOBYPASSRLS"
       - run: npx prisma migrate deploy                       # вся история с нуля
+      - run: npm run generate                                # prisma generate --sql: TypedSQL проверяет запросы на настоящей базе, поэтому — ПОСЛЕ migrate deploy
       - name: Схема совпадает с базой после миграций
         run: npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code   # 0 — совпало, 2 — есть различия
       - name: Эталонная база для тестов
@@ -290,7 +363,7 @@ jobs:
       - run: npx vitest run
 ```
 
-Что здесь важно: (1) **`migrate deploy`, а не `dev`** — CI ничего не придумывает и не спрашивает; (2) **роль приложения** создаётся отдельным шагом (пароль — **только для CI**, а не рабочий; настоящие пароли — в секретах репозитория); (3) шаг **«схема совпадает с базой после миграций»**: `migrate diff --from-config-datasource --to-schema … --exit-code` (флаги Prisma 7 — по справочнику CLI) завершается кодом `2`, если кто-то изменил `schema.prisma` и забыл создать миграцию; **сверьтесь**, что ручные объекты (частичные индексы, `EXCLUDE`, триггеры), которых Prisma не описывает, не дают ложного расхождения; (4) **`prisma generate`** — отдельный обязательный шаг (в Prisma 7 автоматически не вызывается); (5) для TypedSQL нужен `prisma generate --sql` **после** `migrate deploy` — базе нужно существовать при генерации.
+Что здесь важно: (1) **`migrate deploy`, а не `dev`** — CI ничего не придумывает и не спрашивает; (2) **роль приложения** создаётся отдельным шагом (пароль — **только для CI**, а не рабочий; настоящие пароли — в секретах репозитория); (3) шаг **«схема совпадает с базой после миграций»**: `migrate diff --from-config-datasource --to-schema … --exit-code` (флаги Prisma 7 — по справочнику CLI) завершается кодом `2`, если кто-то изменил `schema.prisma` и забыл создать миграцию; **сверьтесь**, что ручные объекты (частичные индексы, `EXCLUDE`, триггеры), которых Prisma не описывает, не дают ложного расхождения; (4) **генерация клиента** — отдельный обязательный шаг (в Prisma 7 автоматически не вызывается); (5) из-за TypedSQL это `prisma generate --sql` (в лабе — `npm run generate`) и идёт **после** `migrate deploy`: запросы из `prisma/sql` проверяются на настоящей базе, поэтому она должна уже существовать со всеми таблицами.
 
 ### why
 Робот-контролёр защищает от трёх классов поломок: «забыл закоммитить миграцию», «миграция работает только у меня» и «после обновления зависимостей что-то поплыло». Единственная цена — потраченное один раз время на настройку.
@@ -325,8 +398,8 @@ COPY package*.json ./
 RUN npm ci
 COPY prisma ./prisma
 COPY prisma.config.ts tsconfig.json ./
-COPY src ./src
-RUN npx prisma generate && npx tsc -p tsconfig.build.json     # клиент создаётся при сборке образа
+COPY src ./src                                                # src/generated сюда приходит уже готовым: см. ниже про TypedSQL
+RUN npx tsc -p tsconfig.build.json
 
 FROM node:24-slim AS run
 WORKDIR /app
@@ -367,7 +440,7 @@ if (url.pathname === '/health') {
 docker run --rm --env-file .env.release rentkit-tools npx prisma migrate deploy
 ```
 
-(Для этого нужен либо образ со стадией `tools` и `prisma` CLI, либо запуск `migrate deploy` из CI до обновления копий.) Что надо учесть: (1) **`prisma` (CLI) — dev-зависимость**, а в рабочий образ идёт только клиент и адаптер (`--omit=dev`); (2) папка **`src/generated`** должна быть собрана в `dist` (поэтому `generate` — **до** `tsc`); (3) если используешь TypedSQL — `prisma generate --sql` на сборке требует доступной базы (в CI она есть); (4) **миграции — до** обновления копий приложения, а изменения схемы — **совместимые** (expand/contract, сессия 10), иначе старая копия сломается на новой схеме.
+(Для этого нужен либо образ со стадией `tools` и `prisma` CLI, либо запуск `migrate deploy` из CI до обновления копий.) Что надо учесть: (1) **`prisma` (CLI) — dev-зависимость**, а в рабочий образ идёт только клиент и адаптер (`--omit=dev`); (2) папка **`src/generated`** должна быть собрана в `dist` (поэтому `generate` — **до** `tsc`); (3) **TypedSQL ломает привычное «`RUN npx prisma generate` в Dockerfile»**: `prisma generate --sql` проверяет запросы на настоящей базе, а при `docker build` базы нет — обычный `generate` без `--sql` пересоздаст клиент без `sql.ts`, и `tsc` упадёт на импорте `../generated/prisma/sql.js`. Поэтому у нас клиент генерируется **в CI, где база есть** (шаг `npm run generate` после `migrate deploy`, см. 18.3), а `docker build` запускается после него и копирует готовую папку `src/generated` (она в `.gitignore`, но в контексте сборки CI лежит). Если TypedSQL в проекте нет — работает классическая схема с `RUN npx prisma generate` в Dockerfile; (4) **миграции — до** обновления копий приложения, а изменения схемы — **совместимые** (expand/contract, сессия 10), иначе старая копия сломается на новой схеме.
 
 ```bash run
 cd ~/prisma-lab/rentkit
@@ -379,7 +452,7 @@ cat > tsconfig.build.json <<'EOF'
   "exclude": ["src/lessons", "src/intro"]
 }
 EOF
-npx prisma generate && npx tsc -p tsconfig.build.json && ls dist | head
+npm run generate && npx tsc -p tsconfig.build.json && ls dist | head
 ```
 
 ### result
@@ -434,20 +507,22 @@ if (url.pathname === '/metrics') {
 
 ```ts
 // src/tracing.ts — подключается ПЕРВЫМ, до остального кода
-import { NodeSDK } from '@opentelemetry/sdk-node'
-import { ConsoleSpanExporter } from '@opentelemetry/sdk-trace-node'
+import { NodeTracerProvider, ConsoleSpanExporter, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-node'
+import { registerInstrumentations } from '@opentelemetry/instrumentation'
 import { PrismaInstrumentation } from '@prisma/instrumentation'
 
-const sdk = new NodeSDK({
-  traceExporter: new ConsoleSpanExporter(),              // для обучения — в консоль; в проде — OTLP-экспортёр
-  instrumentations: [new PrismaInstrumentation()],
+const provider = new NodeTracerProvider({
+  spanProcessors: [new SimpleSpanProcessor(new ConsoleSpanExporter())],   // для обучения — в консоль; в проде — OTLP-экспортёр
 })
-sdk.start()
+provider.register()
+registerInstrumentations({ instrumentations: [new PrismaInstrumentation()] })
 ```
+
+**Про версии (проверено 22.10.2026).** Привычный `npm install @opentelemetry/sdk-node …` сейчас падает с `ERESOLVE`: свежий `sdk-node` 0.300 требует `@opentelemetry/api` ≥ 1.10, а `sdk-trace-node` 2.x — строго ниже 1.10, и единой версии `api` для обоих нет. Поэтому ставим набор, который друг другу не противоречит: `api@1.9.1`, `sdk-trace-node@2`, `instrumentation@0.223` и `@prisma/instrumentation`; а вместо «комбайна» `NodeSDK` собираем трассировщик из двух частей (`NodeTracerProvider` + `registerInstrumentations`).
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npm install @opentelemetry/sdk-node @opentelemetry/sdk-trace-node @prisma/instrumentation
+npm install @opentelemetry/api@1.9.1 @opentelemetry/sdk-trace-node@2 @opentelemetry/instrumentation@0.223 @prisma/instrumentation
 cat > src/lessons/18-trace.ts <<'EOF'
 import '../tracing.js'
 import { prisma } from '../db.js'
@@ -461,7 +536,7 @@ npx tsx src/lessons/18-trace.ts 2>&1 | grep -E "name:|duration" | head -12
 ```out auto
 ```
 
-Ожидаем: span'ы вида `prisma:client:operation` (вызов `findMany`) и вложенные `prisma:engine:db_query` (отдельные SQL-запросы) с длительностью. Суть трассировки: видно, **из чего состоит** медленный запрос и **где** ушло время — в сети, в самой базе, в сборке результата.
+Ожидаем: span'ы вида `prisma:client:operation` (вызов `findMany`) и вложенные `prisma:client:serialize`, `prisma:client:connect`, `prisma:client:compile`, `prisma:client:db_query` (сам SQL-запрос) с длительностью `duration` в **микросекундах** (24241 ≈ 24 мс). Суть трассировки: видно, **из чего состоит** медленный запрос и **где** ушло время — в сети, в самой базе, в сборке результата.
 
 **Что собирать и чего — нет:** собирай **число и длительность** операций, коды ошибок, медленные запросы; **не пиши** значения параметров (телефоны, суммы, токены — шаг 16.5), тела запросов, `DATABASE_URL`. Медленные запросы логируй **формой** (имя операции, модель, время), а подробности — по необходимости и с маскированием.
 
@@ -469,6 +544,7 @@ npx tsx src/lessons/18-trace.ts 2>&1 | grep -E "name:|duration" | head -12
 Наблюдаемость — условие того, чтобы жить с системой после выпуска: без неё каждая проблема — «детективное расследование по слухам». А принципы «числа — да, значения — нет» защищают заодно и от утечки данных через мониторинг.
 
 ### deep Если не получилось
+- **`ERESOLVE` при установке** — версии пакетов OpenTelemetry несовместимы по `@opentelemetry/api` (см. выше): ставь ровно набор из шага, а не «последнее всё».
 - **`Cannot find module '@prisma/instrumentation'`** — пакет не установлен или имя изменилось; смотри актуальную страницу документации.
 - **Span'ов нет** — `tracing.ts` должен подключаться **первым** (до `db.ts`), иначе клиент создаётся без инструментирования.
 
@@ -582,18 +658,23 @@ export async function importEvents(bookingIds: number[]) {
   await Promise.all(bookingIds.map((id) =>
     prisma.$transaction(async (tx) => {
       await tx.eventLog.create({ data: { bookingId: id, kind: 'import' } })
-      await new Promise((r) => setTimeout(r, 300))          // «обращение к внешнему справочнику»
+      await new Promise((r) => setTimeout(r, 500))          // «обращение к внешнему справочнику»
     })))
 }
 ```
 
 ```ts
 // hell/src/scope.ts
-import { prisma } from '../../src/db.js'
+import 'dotenv/config'
+import { PrismaPg } from '@prisma/adapter-pg'
+import { PrismaClient } from '../../src/generated/prisma/client.js'
+
+// клиент приложения: роль rental_app (RLS действует) и пул из ОДНОГО соединения — чтобы протечка воспроизводилась всегда
+const app = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.APP_DATABASE_TEST_URL ?? process.env.APP_DATABASE_URL!, max: 1 }) })
 
 export async function countBookingsAs(branchId: number | null) {
-  if (branchId !== null) await prisma.$executeRaw`SELECT set_config('app.branch_id', ${String(branchId)}, false)`
-  return prisma.booking.count()
+  if (branchId !== null) await app.$executeRaw`SELECT set_config('app.branch_id', ${String(branchId)}, false)`
+  return app.booking.count()
 }
 ```
 
@@ -647,7 +728,9 @@ describe('production hell', () => {
   }, 15_000)
 
   it('5. безымянный запрос не видит чужих броней', async () => {
-    await countBookingsAs(3)                               // филиал 3 «поработал» на этом соединении…
+    const b = await makeBranch(), item = await makeItem(b.id)
+    await prisma.booking.create({ data: { branchId: b.id, itemId: item.id, status: 'CONFIRMED', startsAt: new Date(2051, 0, 1), endsAt: new Date(2051, 0, 2) } })   // в тестовой базе должны быть чужие данные
+    await countBookingsAs(b.id)                            // филиал «поработал» на этом соединении…
     const anonymous = await countBookingsAs(null)          // …а теперь аноним (без объявленного филиала)
     expect(anonymous).toBe(0)
   })
@@ -672,7 +755,7 @@ DB_POOL_MAX=3 npx vitest run hell 2>&1 | tail -40
 
 **Задание:** довести **все пять** тестов до зелёного, не меняя `hell/test/hell.test.ts`; для каждого — записать в `NOTES.md` три строки: **симптом**, **причина**, **почему именно это исправление** (и какая сессия объясняла идею). Инструменты: лог запросов (`SQL_LOG=1`), `EXPLAIN`, `psql`, `migrate status`/`diff`, `pg_stat_activity`. Правила: чинить в `hell/src/*` и (для №3) в миграциях/схеме; **не** отключать проверки (`it.skip`), **не** увеличивать таймауты в тестах.
 
-**Приёмка сессии:** набор тестов из 18.1–18.2 зелёный; CI-конфигурация написана и описана (первый прогон — на вашем репозитории); образ собирается (`generate` до `tsc`); метрики и трассировка подключены; пять дефектов «Hell» исправлены, у каждого есть объяснение в `NOTES.md`.
+**Приёмка сессии:** набор тестов из 18.1–18.2 зелёный; CI-конфигурация написана и описана (первый прогон — на вашем репозитории); образ собирается (клиент сгенерирован до `tsc`); метрики и трассировка подключены; пять дефектов «Hell» исправлены, у каждого есть объяснение в `NOTES.md`.
 
 ### why
 Это итоговый тренажёр по всему курсу: N+1 (сессия 6), потерянное обновление (12), дрейф схемы (11), исчерпание пула (17) и протечка через пул (16). Умение узнавать **знакомую поломку в незнакомом коде** — то, ради чего всё это писалось: в реальной работе тебя не предупредят, что именно сломано.

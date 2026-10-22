@@ -25,10 +25,18 @@ const adapter = new PrismaPg({
 })
 ```
 
+```bash run hidden
+cd ~/prisma-lab/rentkit && node -e "
+const fs=require('fs');let s=fs.readFileSync('src/db.ts','utf8');
+s=s.replace('new PrismaPg({ connectionString: process.env.APP_DATABASE_URL ?? process.env.DATABASE_URL! })','new PrismaPg({\n  connectionString: process.env.APP_DATABASE_URL ?? process.env.DATABASE_URL!,\n  max: Number(process.env.DB_POOL_MAX ?? 10),\n  connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS ?? 3_000),\n  idleTimeoutMillis: 10_000,\n})');
+fs.writeFileSync('src/db.ts',s)"
+```
+
 Увидим очередь за соединениями на крошечном пуле:
 
 ```ts
 // src/lessons/17-pool.ts
+import 'dotenv/config'                             // скрипт не импортирует db.ts — .env читаем сами
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 
@@ -37,7 +45,7 @@ const make = (max: number, wait: number) => new PrismaClient({ adapter: new Pris
 for (const [label, wait] of [['без таймаута ожидания', 0], ['таймаут 800 мс', 800]] as const) {
   const prisma = make(2, wait)                                                // всего 2 соединения
   const t0 = Date.now()
-  const r = await Promise.allSettled(Array.from({ length: 6 }, () => prisma.$queryRaw`SELECT pg_sleep(0.5)`))   // 6 запросов по 0,5 с
+  const r = await Promise.allSettled(Array.from({ length: 6 }, () => prisma.$queryRaw`SELECT 1 FROM pg_sleep(0.5)`))   // 6 запросов по 0,5 с
   const ok = r.filter((x) => x.status === 'fulfilled').length
   console.log(label.padEnd(24), `успешно ${ok}/6, всего ${Date.now() - t0} мс`)
   await prisma.$disconnect()
@@ -86,14 +94,15 @@ npx tsx src/lessons/17-pool.ts
 
 ```ts
 // src/lessons/17-clients.ts
+import 'dotenv/config'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../generated/prisma/client.js'
 
 const clients = Array.from({ length: 15 }, () => new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 10 }) }))
 // каждому клиенту — по 10 одновременных запросов: 150 соединений на базу со 100 линиями
-const results = await Promise.allSettled(clients.flatMap((c) => Array.from({ length: 10 }, () => c.$queryRaw`SELECT pg_sleep(1)`)))
+const results = await Promise.allSettled(clients.flatMap((c) => Array.from({ length: 10 }, () => c.$queryRaw`SELECT 1 FROM pg_sleep(1)`)))
 const failed = results.filter((r) => r.status === 'rejected') as PromiseRejectedResult[]
-console.log('упало:', failed.length, ' пример:', String(failed[0]?.reason?.message).split('\n')[0])
+console.log('упало:', failed.length, ' пример:', String(failed[0]?.reason?.message).split('\n').filter(Boolean).at(-1))
 await Promise.allSettled(clients.map((c) => c.$disconnect()))
 ```
 
@@ -110,6 +119,7 @@ npx tsx src/lessons/17-clients.ts
 
 ```ts
 // src/db.ts — защита от повторного создания при горячей перезагрузке
+import 'dotenv/config'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from './generated/prisma/client.js'
 
@@ -176,7 +186,7 @@ services:
     ports: ["6432:5432"]
 ```
 
-```bash
+```bash nofile
 # .env
 APP_DATABASE_URL="postgresql://rental_app:…@localhost:6432/rental"     # приложение → PgBouncer
 DIRECT_URL="postgresql://postgres:postgres@localhost:5433/rental"       # миграции → база напрямую
@@ -220,7 +230,7 @@ export default defineConfig({
 
 Тест нагружает ваш HTTP-слой — маленький сервер (не часть лабы про веб, просто «оболочка» вокруг слоя данных). Сначала помощник интерактивной области видимости (нужен серверу, потому что RLS закрыт по умолчанию):
 
-```ts
+```ts append=src/extensions/branch-scope.ts
 // src/extensions/branch-scope.ts — добавить
 export async function withScope<T>(scope: Scope, fn: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
   return base.$transaction(async (tx) => {
@@ -274,9 +284,9 @@ npm install -D autocannon
 sleep 3
 psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
 psqlr 'SELECT pg_stat_statements_reset()' >/dev/null
-for p in "booking?id=12345" "search?q=иван" "branch-report?branch=5"; do
+for p in "booking?id=12345" "search?q=%D0%B8%D0%B2%D0%B0%D0%BD" "branch-report?branch=5"; do
   echo "== /$p"
-  npx autocannon -c 40 -d 8 --json "http://localhost:3100/$p" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log("RPS",Math.round(r.requests.average),"p50",r.latency.p50,"p99",r.latency.p99,"non2xx",r.non2xx,"errors",r.errors)})'
+  npx autocannon -c 40 -d 8 --json "http://127.0.0.1:3100/$p" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log("RPS",Math.round(r.requests.average),"p50",r.latency.p50,"p99",r.latency.p99,"non2xx",r.non2xx,"errors",r.errors)})'
 done
 psqlr "SELECT calls, round(total_exec_time::numeric) AS total_ms, round(mean_exec_time::numeric, 2) AS mean_ms, left(query, 70) AS query FROM pg_stat_statements WHERE query ILIKE '%tbl_%' ORDER BY total_exec_time DESC LIMIT 5"
 ```
@@ -323,7 +333,7 @@ pkill -f "tsx src/server.ts" || true
 
 Нужна большая таблица. Журнал событий выдачи (1 000 000 строк):
 
-```prisma
+```prisma schema
 model EventLog {
   id        BigInt   @id @default(autoincrement())
   bookingId Int      @map("booking_id")
@@ -337,21 +347,21 @@ model EventLog {
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --name event_log
-npx prisma generate
+npm run generate
 cat > src/lessons/17-seed.ts <<'EOF'
 import { prisma } from '../db.js'
 import { timed } from '../lib/timed.js'
 
 const N = 100_000          // для сравнения способов — 100 тысяч, не миллион
 
-await prisma.$executeRaw`TRUNCATE event_log`
+await prisma.$executeRaw`DELETE FROM event_log`           // TRUNCATE рабочей роли не выдан (16.2) — стираем DELETE-ом
 
 await timed('createMany, пачки по 5 000', async () => {
   for (let lo = 0; lo < N; lo += 5000) {
     await prisma.eventLog.createMany({ data: Array.from({ length: 5000 }, (_, i) => ({ bookingId: 1 + ((lo + i) % 300000), kind: 'issue' })) })
   }
 })
-await prisma.$executeRaw`TRUNCATE event_log`
+await prisma.$executeRaw`DELETE FROM event_log`
 
 await timed('INSERT … SELECT generate_series', () =>
   prisma.$executeRaw`INSERT INTO event_log (booking_id, kind) SELECT 1 + (g % 300000), 'issue' FROM generate_series(1, ${N}) g`)
@@ -366,7 +376,7 @@ npx tsx src/lessons/17-seed.ts
 ```out auto
 ```
 
-Ожидаем: `createMany` пачками — секунды, `INSERT … SELECT generate_series` — **в десятки раз быстрее** (данные рождаются внутри базы, без поездок по сети и разбора параметров). Для **внешних** данных (CSV из файла) самый быстрый способ — `COPY` (`\copy` в `psql`, либо `pg-copy-streams` из Node). Правила выбора: **данные уже в базе или генерируются** — `INSERT … SELECT`; **данные приходят из приложения** — `createMany` пачками по 1–5 тысяч строк (не больше 65 535 параметров на запрос); **файл** — `COPY`.
+Ожидаем: `createMany` пачками — секунды, `INSERT … SELECT generate_series` — **в разы и десятки раз быстрее** (у нас ≈3,4 с против ≈0,2 с, то есть примерно 17×) (данные рождаются внутри базы, без поездок по сети и разбора параметров). Для **внешних** данных (CSV из файла) самый быстрый способ — `COPY` (`\copy` в `psql`, либо `pg-copy-streams` из Node). Правила выбора: **данные уже в базе или генерируются** — `INSERT … SELECT`; **данные приходят из приложения** — `createMany` пачками по 1–5 тысяч строк (не больше 65 535 параметров на запрос); **файл** — `COPY`.
 
 Теперь **обход** миллиона строк порциями (потоковой выборки у Prisma нет — берём по ключу):
 
@@ -374,7 +384,7 @@ npx tsx src/lessons/17-seed.ts
 // src/lessons/17-walk.ts
 import { prisma } from '../db.js'
 
-await prisma.$executeRaw`TRUNCATE event_log`
+await prisma.$executeRaw`DELETE FROM event_log`
 await prisma.$executeRaw`INSERT INTO event_log (booking_id, kind) SELECT 1 + (g % 300000), 'issue' FROM generate_series(1, 1000000) g`
 
 const BATCH = 5000
@@ -399,7 +409,7 @@ npx tsx src/lessons/17-walk.ts
 ```out auto
 ```
 
-Ожидаем: **миллион строк обработан, пик памяти — десятки мегабайт** (одна порция, а не весь миллион). Приём — keyset-обход из шага 8.2: `where id > lastId order by id take N`. Читать «всё сразу» (`findMany()` без `take`) на такой таблице — классический способ уронить приложение по памяти.
+Ожидаем: **миллион строк обработан, пик памяти — порядка ста мегабайт** (у нас ~108 МБ: это сам Node с клиентом и одна порция, а не весь миллион). Приём — keyset-обход из шага 8.2: `where id > lastId order by id take N`. Читать «всё сразу» (`findMany()` без `take`) на такой таблице — классический способ уронить приложение по памяти.
 
 ### why
 Объёмы данных — граница, на которой наивный код перестаёт работать: сидирование «циклом create» занимало бы часы, а «загрузить всё и обработать» не помещалось бы в память. Знание трёх способов вставки и одного способа обхода покрывает 95 % практических случаев.
@@ -463,7 +473,7 @@ npx tsx src/lessons/17-timeout.ts
 ```out auto
 ```
 
-Ожидаем: первый запрос оборван через ~5 секунд ошибкой `canceling statement due to statement timeout` (код `57014`, **сверьтесь**, как её классифицирует Prisma), второй — через 0,5 с. **Два уровня ограничения:** по умолчанию — для роли (общая страховка), для особых запросов — `SET LOCAL` в транзакции (**только на неё**: `LOCAL` сбрасывается в конце, поэтому не протекает в пул). Отдельно от них у Prisma свои таймауты **интерактивной транзакции** (`timeout`, `maxWait`) — они работают на стороне клиента и не заменяют серверных.
+Ожидаем: первый запрос оборван через ~5 секунд ошибкой `canceling statement due to statement timeout` (код `57014`; через `$queryRaw` она приходит как `Raw query failed. Code: 57014`, как в выводе выше), второй — через 0,5 с. **Два уровня ограничения:** по умолчанию — для роли (общая страховка), для особых запросов — `SET LOCAL` в транзакции (**только на неё**: `LOCAL` сбрасывается в конце, поэтому не протекает в пул). Отдельно от них у Prisma свои таймауты **интерактивной транзакции** (`timeout`, `maxWait`) — они работают на стороне клиента и не заменяют серверных.
 
 ### why
 Таймаут — обязательный пояс безопасности. Без него один «залипший» запрос или забытая блокировка превращается в каскад: соединения заняты, очередь растёт, сервис «падает», хотя база формально жива.
@@ -492,7 +502,7 @@ npx tsx src/lessons/17-timeout.ts
 
 Добавим в `src/server.ts` «рассылку» — типичный вид этой ошибки:
 
-```ts
+```ts splice=src/server.ts@send\(res,\s404
 // src/server.ts — добавить ветку
 if (url.pathname === '/remind') {                                       // POST-подобный: отправить напоминание и записать, что отправили
   const id = Number(url.searchParams.get('id'))
@@ -505,14 +515,19 @@ if (url.pathname === '/remind') {                                       // POST-
 }
 ```
 
-Воспроизведи:
+Воспроизведи (нагрузка на `/remind` идёт в фоне; в середине смотрим, что делает база, и пробуем «простой» эндпоинт):
 
 ```bash run
 cd ~/prisma-lab/rentkit
 (npx tsx src/server.ts > /tmp/rentkit-server.log 2>&1 &)
 sleep 3
-npx autocannon -c 30 -d 10 --json "http://localhost:3100/remind?id=1" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log("RPS",Math.round(r.requests.average),"p99",r.latency.p99,"non2xx",r.non2xx,"timeouts",r.timeouts)})'
-npx autocannon -c 5 -d 3 --json "http://localhost:3100/booking?id=1" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log("простой эндпоинт при этом: RPS",Math.round(r.requests.average),"p99",r.latency.p99)})'
+(npx autocannon -c 30 -d 10 --json "http://127.0.0.1:3100/remind?id=1" 2>/dev/null > /tmp/remind.json &)
+sleep 4
+psqlr() { docker exec -i rental-pg psql -U postgres -d rental -c "$@"; }
+psqlr "SELECT state, count(*) FROM pg_stat_activity WHERE datname = 'rental' GROUP BY 1 ORDER BY 2 DESC"
+npx autocannon -c 5 -d 3 --json "http://127.0.0.1:3100/booking?id=1" 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s);console.log("простой эндпоинт при этом: RPS",Math.round(r.requests.average),"p99",r.latency.p99,"non2xx",r.non2xx)})'
+sleep 5
+node -e 'const r=JSON.parse(require("fs").readFileSync("/tmp/remind.json","utf8"));console.log("/remind: RPS",Math.round(r.requests.average),"p99",r.latency.p99,"non2xx",r.non2xx,"timeouts",r.timeouts)'
 pkill -f "tsx src/server.ts" || true
 ```
 

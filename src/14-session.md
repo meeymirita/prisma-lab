@@ -81,7 +81,7 @@ npx tsx src/lessons/14-decimal.ts
 
 Заведём счета и проводки. Знак суммы: **плюс** — счёт «получил» (дебет), **минус** — «отдал» (кредит). Сумма всех проводок одной операции (`tx_id`) должна быть **ноль**.
 
-```prisma
+```prisma schema
 model LedgerAccount {
   id      Int            @id @default(autoincrement())
   code    String         @unique
@@ -106,7 +106,13 @@ model LedgerEntry {
 }
 ```
 
-```sql
+Создадим миграцию без применения и допишем в неё начальные счета:
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name ledger && sleep 1
+```
+
+```sql tail=prisma/migrations/*_ledger/migration.sql
 -- в созданную `migrate dev --create-only --name ledger` дописать начальные счета
 INSERT INTO "ledger_account" (code, name) VALUES
   ('CASH',     'Касса и банк'),
@@ -117,10 +123,8 @@ ALTER TABLE "ledger_entry" ADD CONSTRAINT ledger_entry_amount_ck CHECK (amount <
 
 ```bash run
 cd ~/prisma-lab/rentkit
-npx prisma migrate dev --create-only --name ledger
-# допиши SQL со счетами в migration.sql, затем:
 npx prisma migrate dev
-npx prisma generate
+npm run generate
 ```
 
 ### result
@@ -139,24 +143,24 @@ const acc = Object.fromEntries((await prisma.ledgerAccount.findMany()).map((a) =
 await prisma.$executeRaw`
   WITH p AS (SELECT id, booking_id, amount, paid_at, gen_random_uuid() AS tx FROM "tbl_Payments" WHERE kind IN (1, 2) AND amount > 0)
   INSERT INTO ledger_entry (tx_id, account_id, amount, booking_id, payment_id, created_at)
-  SELECT tx, ${acc.CASH}, amount, booking_id, id, paid_at FROM p
-  UNION ALL SELECT tx, ${acc.REVENUE}, -amount, booking_id, id, paid_at FROM p`
+  SELECT tx, ${acc.CASH}::int, amount, booking_id, id, paid_at FROM p
+  UNION ALL SELECT tx, ${acc.REVENUE}::int, -amount, booking_id, id, paid_at FROM p`
 
 // возвраты: Выручка +, Касса −
 await prisma.$executeRaw`
   WITH p AS (SELECT id, booking_id, amount, paid_at, gen_random_uuid() AS tx FROM "tbl_Payments" WHERE kind = 3 AND amount > 0)
   INSERT INTO ledger_entry (tx_id, account_id, amount, booking_id, payment_id, created_at)
-  SELECT tx, ${acc.REVENUE}, amount, booking_id, id, paid_at FROM p
-  UNION ALL SELECT tx, ${acc.CASH}, -amount, booking_id, id, paid_at FROM p`
+  SELECT tx, ${acc.REVENUE}::int, amount, booking_id, id, paid_at FROM p
+  UNION ALL SELECT tx, ${acc.CASH}::int, -amount, booking_id, id, paid_at FROM p`
 
 // залог принят: Касса +, Залоги −;  возвращён: Залоги +, Касса −;  оставлен: Залоги +, Выручка −
 await prisma.$executeRaw`
   WITH d AS (SELECT booking_id, round(abs(delta)::numeric, 2) AS amt, to_timestamp(ts) AS at, reason, gen_random_uuid() AS tx
              FROM "tbl_DepositLog" WHERE delta <> 0 AND booking_id IS NOT NULL)
   INSERT INTO ledger_entry (tx_id, account_id, amount, booking_id, created_at)
-  SELECT tx, CASE reason WHEN 'hold' THEN ${acc.CASH} ELSE ${acc.DEPOSITS} END, amt, booking_id, at FROM d
+  SELECT tx, CASE reason WHEN 'hold' THEN ${acc.CASH}::int ELSE ${acc.DEPOSITS}::int END, amt, booking_id, at FROM d
   UNION ALL
-  SELECT tx, CASE reason WHEN 'hold' THEN ${acc.DEPOSITS} WHEN 'return' THEN ${acc.CASH} ELSE ${acc.REVENUE} END, -amt, booking_id, at FROM d`
+  SELECT tx, CASE reason WHEN 'hold' THEN ${acc.DEPOSITS}::int WHEN 'return' THEN ${acc.CASH}::int ELSE ${acc.REVENUE}::int END, -amt, booking_id, at FROM d`
 
 console.log(await prisma.ledgerEntry.count(), 'проводок')
 await prisma.$disconnect()
@@ -178,7 +182,7 @@ SQL
 ```out auto
 ```
 
-Ожидаем: **несбалансированных — 0**; остаток `CASH` положительный (деньги в кассе), `REVENUE` — **отрицательный** (в двойной записи доходы — «кредитовое» сальдо), `DEPOSITS` — около нуля или небольшой положительный/отрицательный (залоги, которые ещё не возвращены, — у выданных и просроченных броней). Баланс `CASH + REVENUE + DEPOSITS` = **ноль**: общая сумма всех проводок всегда нулевая — главный признак правильной двойной записи.
+Ожидаем: **несбалансированных — 0**; остаток `CASH` положительный (деньги в кассе; у нас ≈ +753 млн), `REVENUE` — **отрицательный** (в двойной записи доходы — «кредитовое» сальдо; ≈ −751 млн), `DEPOSITS` — небольшой **отрицательный** (≈ −1,8 млн: залоги, которые ещё лежат у нас и принадлежат клиентам, — мы им должны; знак «минус» у обязательства — норма двойной записи). Баланс `CASH + REVENUE + DEPOSITS` = **ноль** (753 097 202 − 751 278 227 − 1 818 975 = 0): общая сумма всех проводок всегда нулевая — главный признак правильной двойной записи.
 
 ### why
 Ledger — старейший и самый надёжный способ работы с деньгами: он **добавляется, но не изменяется**. Ошибка исправляется не правкой старой проводки, а новой **компенсирующей**. В результате у каждой копейки есть история «откуда и куда», а остаток невозможно «подогнать».
@@ -421,8 +425,14 @@ SQL
 
 Теперь превратим первый запрос в **правило базы**: «операцию с несбалансированными проводками записать нельзя». Нужен **отложенный** триггер: проводки одной операции вставляются по очереди, баланс проверяется **в конце транзакции**:
 
-```sql
--- prisma/migrations/20261023100000_ledger_balanced/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name ledger_balanced`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name ledger_balanced && sleep 1
+```
+
+```sql into=prisma/migrations/*_ledger_balanced/migration.sql
+-- prisma/migrations/<метка>_ledger_balanced/migration.sql
 CREATE FUNCTION ledger_check_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
   IF (SELECT coalesce(sum(amount), 0) FROM ledger_entry WHERE tx_id = NEW.tx_id) <> 0 THEN
@@ -488,8 +498,14 @@ npx tsx src/lessons/14-unbalanced.ts
 
 Универсальный триггер записывает любую строку «до» и «после» (JSON), а имя исполнителя берёт из параметра сессии `app.actor`, который устанавливает приложение (шаг 16 разовьёт идею):
 
-```sql
--- prisma/migrations/20261023110000_audit/migration.sql
+Создай пустую миграцию (`npx prisma migrate dev --create-only --name audit`) и замени содержимое её `migration.sql` на этот SQL (метка времени в имени папки у тебя будет своя):
+
+```bash run hidden
+cd ~/prisma-lab/rentkit && npx prisma migrate dev --create-only --name audit && sleep 1
+```
+
+```sql into=prisma/migrations/*_audit/migration.sql
+-- prisma/migrations/<метка>_audit/migration.sql
 CREATE TABLE "audit_log" (
     "id"         BIGSERIAL PRIMARY KEY,
     "table_name" TEXT NOT NULL,
@@ -520,6 +536,22 @@ CREATE TRIGGER payments_audit AFTER INSERT OR UPDATE OR DELETE ON "tbl_Payments"
 
 Добавь модель `AuditLog` в схему (чтобы таблица не считалась «лишней»; поля `old_row`/`new_row` — `Json?`) и проверь, как выглядит запись:
 
+```prisma schema
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  tableName String   @map("table_name")
+  rowId     String?  @map("row_id")
+  action    String
+  oldRow    Json?    @map("old_row")
+  newRow    Json?    @map("new_row")
+  actor     String?
+  at        DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([tableName, rowId])
+  @@map("audit_log")
+}
+```
+
 ```ts
 // src/lessons/14-audit.ts
 import { prisma } from '../db.js'
@@ -540,7 +572,7 @@ await prisma.$disconnect()
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate deploy
-npx prisma generate
+npm run generate
 npx tsx src/lessons/14-audit.ts
 ```
 

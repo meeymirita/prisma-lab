@@ -162,14 +162,14 @@ npx tsx src/lessons/15-timing.ts
 
 Добавим колонку клиентам и предметам:
 
-```prisma
+```prisma schema
 model Customer {
-  // …
+  // …поля как раньше…
   deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
   @@index([deletedAt])
 }
 model Item {
-  // …
+  // …поля как раньше…
   deletedAt DateTime? @map("deleted_at") @db.Timestamptz(3)
   @@index([deletedAt])
 }
@@ -178,7 +178,7 @@ model Item {
 ```bash run
 cd ~/prisma-lab/rentkit
 npx prisma migrate dev --name soft_delete_columns
-npx prisma generate
+npm run generate
 ```
 
 ### result
@@ -263,7 +263,7 @@ npx tsx src/lessons/15-soft.ts
 `Prisma.getExtensionContext(this)` — достаёт модель, к которой относится метод (нужно, чтобы вызвать `update` из метода модели). `findUnique` с дополнительным условием `deletedAt: null` работает, потому что Prisma разрешает к уникальному ключу добавлять **неуникальные фильтры** (расширенный `where` для `findUnique`). Метод `softDelete` описан в `model: { customer: … }` — ключ — имя модели **с маленькой буквы**.
 
 ### deep Если не получилось
-- **`Type … deletedAt does not exist`** — клиент не пересоздан после миграции: `npx prisma generate`.
+- **`Type … deletedAt does not exist`** — клиент не пересоздан после миграции: `npm run generate`.
 - **`softDelete is not a function`** — метод вызван у исходного `prisma`, а не у расширенного `db`.
 
 ### quiz

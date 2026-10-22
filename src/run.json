@@ -1,0 +1,13 @@
+{
+ "dind": true,
+ "files_root": "~/prisma-lab/rentkit",
+ "env": {
+  "PRISMA_HIDE_UPDATE_MESSAGE": "1"
+ },
+ "prelude": [
+  ". /etc/prelude.sh"
+ ],
+ "connect_hosts": [
+  "localhost"
+ ]
+}
