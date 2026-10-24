@@ -363,7 +363,7 @@ jobs:
       - run: npx vitest run
 ```
 
-Что здесь важно: (1) **`migrate deploy`, а не `dev`** — CI ничего не придумывает и не спрашивает; (2) **роль приложения** создаётся отдельным шагом (пароль — **только для CI**, а не рабочий; настоящие пароли — в секретах репозитория); (3) шаг **«схема совпадает с базой после миграций»**: `migrate diff --from-config-datasource --to-schema … --exit-code` (флаги Prisma 7 — по справочнику CLI) завершается кодом `2`, если кто-то изменил `schema.prisma` и забыл создать миграцию; **сверьтесь**, что ручные объекты (частичные индексы, `EXCLUDE`, триггеры), которых Prisma не описывает, не дают ложного расхождения; (4) **генерация клиента** — отдельный обязательный шаг (в Prisma 7 автоматически не вызывается); (5) из-за TypedSQL это `prisma generate --sql` (в лабе — `npm run generate`) и идёт **после** `migrate deploy`: запросы из `prisma/sql` проверяются на настоящей базе, поэтому она должна уже существовать со всеми таблицами.
+Что здесь важно: (1) **`migrate deploy`, а не `dev`** — CI ничего не придумывает и не спрашивает; (2) **роль приложения** создаётся отдельным шагом (пароль — **только для CI**, а не рабочий; настоящие пароли — в секретах репозитория); (3) шаг **«схема совпадает с базой после миграций»**: `migrate diff --from-config-datasource --to-schema … --exit-code` (флаги Prisma 7 — по справочнику CLI) завершается кодом `2`, если кто-то изменил `schema.prisma` и забыл создать миграцию; ручные объекты, которых Prisma не описывает (частичные индексы, индексы по выражению, `CHECK`, `EXCLUDE`, триггеры), ложного расхождения **не дают** (проверено на 7.10: `migrate diff` их не замечает), а вот столбец, которого нет в схеме — в том числе генерируемый, вроде `phone_norm`, если его забыли описать, — даёт `DROP COLUMN` и код `2`; (4) **генерация клиента** — отдельный обязательный шаг (в Prisma 7 автоматически не вызывается); (5) из-за TypedSQL это `prisma generate --sql` (в лабе — `npm run generate`) и идёт **после** `migrate deploy`: запросы из `prisma/sql` проверяются на настоящей базе, поэтому она должна уже существовать со всеми таблицами.
 
 ### why
 Робот-контролёр защищает от трёх классов поломок: «забыл закоммитить миграцию», «миграция работает только у меня» и «после обновления зависимостей что-то поплыло». Единственная цена — потраченное один раз время на настройку.
@@ -413,12 +413,12 @@ HEALTHCHECK --interval=10s --timeout=3s --retries=3 CMD node -e "fetch('http://l
 CMD ["node", "dist/server.js"]
 ```
 
-`tsconfig.build.json` — отдельная конфигурация сборки (без тестов и уроков):
+`tsconfig.build.json` — отдельная конфигурация сборки (без тестов и уроков). Строка `rewriteRelativeImportExtensions` обязательна: сгенерированный клиент импортирует свои файлы с суффиксом `.ts` (`./internal/class.ts`), и без неё `tsc` оставит эти импорты как есть — сборка пройдёт, а образ упадёт при старте с `ERR_MODULE_NOT_FOUND … class.ts` (проверено на Prisma 7.10: с флагом образ собирается, `healthcheck` зелёный, процесс работает под пользователем `node`):
 
 ```json
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "outDir": "dist", "rootDir": "src", "noEmit": false },
+  "compilerOptions": { "outDir": "dist", "rootDir": "src", "noEmit": false, "rewriteRelativeImportExtensions": true },
   "include": ["src/db.ts", "src/server.ts", "src/data", "src/lib", "src/extensions", "src/generated", "src/client.ts"],
   "exclude": ["src/lessons", "src/intro"]
 }
@@ -447,7 +447,7 @@ cd ~/prisma-lab/rentkit
 cat > tsconfig.build.json <<'EOF'
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "outDir": "dist", "rootDir": "src", "noEmit": false },
+  "compilerOptions": { "outDir": "dist", "rootDir": "src", "noEmit": false, "rewriteRelativeImportExtensions": true },
   "include": ["src/db.ts", "src/server.ts", "src/data", "src/lib", "src/extensions", "src/generated", "src/client.ts"],
   "exclude": ["src/lessons", "src/intro"]
 }
@@ -463,6 +463,7 @@ npm run generate && npx tsc -p tsconfig.build.json && ls dist | head
 Две частые ошибки образов с Prisma: (1) забытый `generate` — приложение падает при старте «Cannot find module generated/prisma»; (2) миграции в `CMD` — при масштабировании 5 копий одновременно запускают `migrate deploy`, и одна из них (или все) получают блокировки и ошибки. Разделение «сборка → миграция → запуск» снимает обе.
 
 ### deep Если не получилось
+- **Образ собрался, но контейнер падает: `Cannot find module '…/generated/prisma/internal/class.ts'`** — в `tsconfig.build.json` нет `rewriteRelativeImportExtensions: true`.
 - **`tsc` ругается на `import.meta`/ESM** — в сборочном `tsconfig` должны быть `module: NodeNext`, `moduleResolution: NodeNext` (унаследованы из основного).
 - **Образ не стартует: нет `DATABASE_URL`** — `dotenv/config` читает `.env` из рабочей папки; в продакшне переменные задаются окружением контейнера, `.env` в образ **не** копируется.
 
@@ -503,7 +504,7 @@ if (url.pathname === '/metrics') {
 
 Формат строк `имя значение` понимает Prometheus (подключается так же, как в Kubernetes-лабе, сессия 11).
 
-**Уровень 2 — трассировка OpenTelemetry.** Prisma умеет создавать **span'ы** (отрезки времени) для каждой операции и каждого SQL-запроса; они складываются в трассу запроса. В Prisma 7 это делается через пакет `@prisma/instrumentation` (**сверьтесь** с документацией «OpenTelemetry tracing»: состав пакетов и подключение менялись):
+**Уровень 2 — трассировка OpenTelemetry.** Prisma умеет создавать **span'ы** (отрезки времени) для каждой операции и каждого SQL-запроса; они складываются в трассу запроса. В Prisma 7 это делается через пакет `@prisma/instrumentation` (подробности и состав пакетов — в документации «OpenTelemetry tracing»; ниже набор, проверенный на 7.10):
 
 ```ts
 // src/tracing.ts — подключается ПЕРВЫМ, до остального кода
