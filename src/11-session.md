@@ -314,7 +314,7 @@ ALTER TABLE "tbl_Payments" DROP CONSTRAINT payments_nn_ck;
 CREATE UNIQUE INDEX "tbl_Payments_ext_ref_key" ON "tbl_Payments"("ext_ref");
 ```
 
-И в схеме: обязательные поля (`startsAt DateTime`, `endsAt DateTime`, `status BookingStatus`, у платежа `amount Decimal`, `paidAt DateTime`), `@unique` на `extRef` у платежа, а `CHECK` Prisma не описывает (они живут только в SQL, **сверьтесь**: Prisma пропускает check-ограничения при сравнении).
+И в схеме: обязательные поля (`startsAt DateTime`, `endsAt DateTime`, `status BookingStatus`, у платежа `amount Decimal`, `paidAt DateTime`), `@unique` на `extRef` у платежа, а `CHECK` Prisma не описывает (они живут только в SQL; проверено на 7.10: `migrate diff` базы со схемой их не замечает и удалять не предлагает).
 
 ```prisma schema hidden
 model Booking {
@@ -383,7 +383,7 @@ psqlr "SELECT count(*) AS дублей_ext_ref FROM (SELECT ext_ref FROM \"tbl_P
 ```out auto
 ```
 
-Ожидаем: ограничения `…_ck` и ключи со `convalidated = t`; дублей `ext_ref` — 0. Шаблон «`CHECK NOT VALID` → `VALIDATE` → `SET NOT NULL` → `DROP CONSTRAINT`» работает потому, что PostgreSQL, увидев проверенное `CHECK (col IS NOT NULL)`, **не сканирует таблицу повторно** при `SET NOT NULL` (с версии 12). `CREATE UNIQUE INDEX` на большой таблице в продакшне делают с `CONCURRENTLY` — но такая команда **нельзя** выполнять внутри транзакции, а миграция Prisma выполняется одним скриптом: отдельная миграция из одной команды (**сверьтесь** с поведением вашей версии; при проблемах Prisma просит `-- CreateIndex` отдельно).
+Ожидаем: ограничения `…_ck` и ключи со `convalidated = t`; дублей `ext_ref` — 0. Шаблон «`CHECK NOT VALID` → `VALIDATE` → `SET NOT NULL` → `DROP CONSTRAINT`» работает потому, что PostgreSQL, увидев проверенное `CHECK (col IS NOT NULL)`, **не сканирует таблицу повторно** при `SET NOT NULL` (с версии 12). `CREATE UNIQUE INDEX` на большой таблице в продакшне делают с `CONCURRENTLY` — но такая команда **нельзя** выполнять внутри транзакции, а миграция Prisma выполняется одним скриптом: отдельная миграция из одной команды (проверено на 7.10: файл `migration.sql` с одной строкой `CREATE INDEX CONCURRENTLY …` применяется `migrate deploy` без ошибок; несколько команд в одном файле с `CONCURRENTLY` не смешивай).
 
 ### why
 Ограничения — вторая линия обороны после типов: даже если код ошибётся, база не даст записать абсурд («конец раньше начала»). А аккуратное введение ограничений на живой таблице превращает «страшную» операцию в рутину.
@@ -596,20 +596,9 @@ npx prisma migrate status
 ```out auto
 ```
 
-Сделай выход №1 и проверь:
+Про drift больше ни слова. Единственное, что `migrate status` ещё сообщает, — миграция `…_customer_phone_unique` из шага 11.4: мы создали её, но не применили (она применится в шаге 11.6 командой `migrate deploy`).
 
-```bash run
-cd ~/prisma-lab/rentkit
-psqlr() { docker exec -i rental-pg psql -U postgres -d rental "$@"; }
-psqlr -c 'ALTER TABLE "tbl_Branches" DROP COLUMN manager'
-npx prisma migrate status
-```
-
-### result
-```out auto
-```
-
-Хочешь посмотреть расхождение **без** `migrate dev`: `npx prisma migrate diff --help` покажет, как сравнить историю/схему/базу (**сверьтесь**: в Prisma 7 источники называются `--from-migrations`, `--from-schema`, `--to-config-datasource` и так далее). Именно из-за такого drift в Express-лабе периодически возникала ошибка «Drift detected»: там схему создавали двумя способами (сырой SQL-файл и Prisma) — база и история миграций расходились.
+Хочешь посмотреть расхождение **без** `migrate dev`: `npx prisma migrate diff --help` покажет, как сравнить историю/схему/базу (в Prisma 7 источники называются `--from-migrations`, `--from-schema`, `--from-config-datasource`, `--to-…` — проверено по `--help` на 7.10). Именно из-за такого drift в Express-лабе периодически возникала ошибка «Drift detected»: там схему создавали двумя способами (сырой SQL-файл и Prisma) — база и история миграций расходились.
 
 ### why
 Drift — самое частое «непонятное» сообщение Prisma Migrate, и на него обычно реагируют самым плохим способом («ладно, сбросить»). Теперь ты знаешь, что означает сообщение, чем оно вызвано и **три** осознанных ответа на него.
@@ -663,7 +652,7 @@ psqlr '\d "tbl_Branches"'
 - **Не правим применённые миграции** (контрольная сумма): исправление — новой миграцией.
 - **При слиянии веток** пересоздай свою миграцию «поверх» чужих: удали свою папку, подтяни чужие, на чистой dev-базе (`migrate reset`) запусти `migrate dev` заново — Prisma пересоздаст миграцию с актуальным временем и порядком.
 - **`migration_lock.toml`** (в `prisma/migrations`) фиксирует тип базы (`provider = "postgresql"`): не удаляй его и коммить в Git.
-- **В CI** — только `migrate deploy` (не `dev`): применяет то, что есть, и падает, если что-то не так; плюс проверка, что **схема соответствует истории**: сравнение `migrate diff` (из миграций в схему) должно быть пустым (**сверьтесь** с флагами в вашей версии).
+- **В CI** — только `migrate deploy` (не `dev`): применяет то, что есть, и падает, если что-то не так; плюс проверка, что **схема соответствует истории**: сравнение `migrate diff` должно быть пустым (рабочий вариант с флагами Prisma 7 — в шаге 18.3).
 
 Уборка (убери тестовые колонки и миграции, чтобы они не мешали дальше):
 

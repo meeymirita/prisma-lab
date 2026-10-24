@@ -53,7 +53,7 @@ npx tsx src/lessons/07-crud.ts
 ```out auto
 ```
 
-Что видно в логе: `INSERT … RETURNING`, `UPDATE … RETURNING`, `DELETE … RETURNING` — **одним запросом**, база возвращает результат сама. Заметь строки `COMMIT` после `UPDATE`: `update` и `upsert` Prisma выполняет внутри транзакции (с адаптером `pg` строки `BEGIN` в логе запросов не печатаются, а `COMMIT` — печатается). `upsert` в PostgreSQL выполняется через `INSERT … ON CONFLICT … DO UPDATE` только когда `where` указывает на уникальный ключ и в `update`/`create` нет вложенных записей; иначе Prisma делает «найти, потом создать/обновить» несколькими запросами (**сверьтесь** по логу) — и тогда он не атомарен.
+Что видно в логе: `INSERT … RETURNING`, `UPDATE … RETURNING`, `DELETE … RETURNING` — **одним запросом**, база возвращает результат сама. Заметь строки `COMMIT` после `UPDATE`: `update` и `upsert` Prisma выполняет внутри транзакции (с адаптером `pg` строки `BEGIN` в логе запросов не печатаются, а `COMMIT` — печатается). `upsert` в PostgreSQL выполняется через `INSERT … ON CONFLICT … DO UPDATE` только когда `where` указывает на уникальный ключ и в `update`/`create` нет вложенных записей; иначе Prisma делает «найти, потом создать/обновить» несколькими запросами — и тогда он не атомарен. Условия «родного» `upsert` (проверено на 7.10 по логу): в `where` **одно** уникальное поле, **то же значение** есть и в `create`, вложенных записей нет. В нашем примере `create` без `id` — поэтому в логе видны `SELECT`, затем `UPDATE`/`INSERT` и `COMMIT`; а `upsert({ where: { email }, create: { email, … } })` по уникальному `email` даёт один `INSERT … ON CONFLICT … DO UPDATE`.
 
 Ещё два правила: `update` и `delete` по `where` бросают **`P2025`** («запись не найдена»), если ключа нет; `updateMany`/`deleteMany` ничего не бросают — просто вернут `{ count: 0 }`. Чтобы не вернуть лишнее, можно ограничить результат `select`.
 
@@ -389,12 +389,18 @@ Prisma предупредит, что уникальное ограничени�
 import { Prisma } from '../generated/prisma/client.js'
 
 export class NotFoundError extends Error { constructor(what: string) { super(`${what}: не найдено`) } }
-export class DuplicateError extends Error { constructor(public fields: string[]) { super(`Уже существует: ${fields.join(', ')}`) } }
+export class DuplicateError extends Error { constructor(public constraint: string) { super(`Уже существует (ограничение ${constraint})`) } }
+
+function constraintOf(e: Prisma.PrismaClientKnownRequestError): string {
+  const c = (e.meta as any)?.driverAdapterError?.cause?.constraint
+  return c?.index ?? (c?.fields as string[] | undefined)?.join(', ') ?? 'неизвестно'
+}
 
 export function mapDbError(e: unknown): never {
   if (e instanceof Prisma.PrismaClientKnownRequestError) {
-    if (e.code === 'P2002') throw new DuplicateError((e.meta?.target as string[] | undefined) ?? [])
-    if (e.code === 'P2025') throw new NotFoundError(String(e.meta?.cause ?? 'запись'))
+    // с адаптером pg в meta нет `target`: имя ограничения лежит в meta.driverAdapterError.cause.constraint
+    if (e.code === 'P2002') throw new DuplicateError(constraintOf(e))
+    if (e.code === 'P2025') throw new NotFoundError(String(e.meta?.modelName ?? 'запись'))
   }
   throw e
 }
@@ -446,13 +452,13 @@ npx tsx src/lessons/07-errors.ts
 ```out auto
 ```
 
-Три кода, которые встречаются чаще всего: **`P2002`** — нарушено ограничение уникальности (`meta.target` — список полей); **`P2025`** — запись, которую обновляют/удаляют/подключают, не найдена; **`P2003`** — нарушен внешний ключ (родителя нет, либо у родителя есть дети) — возникает **при настоящих внешних ключах** в базе (сессия 11); пока у нас `relationMode = "prisma"`, похожие нарушения Prisma ловит сама (код `P2014`/`P2025` — **сверьтесь**). Полный справочник — раздел «Error reference» документации и наша справка.
+Три кода, которые встречаются чаще всего: **`P2002`** — нарушено ограничение уникальности (с адаптером `pg` имя ограничения — в `meta.driverAdapterError.cause.constraint`, например `tbl_Items_sku_key`; поля `meta.target`, как в старых статьях, **нет**); **`P2025`** — запись, которую обновляют/удаляют/подключают, не найдена; **`P2003`** — нарушен внешний ключ (родителя нет, либо у родителя есть дети) — возникает **при настоящих внешних ключах** в базе (сессия 11); пока у нас `relationMode = "prisma"`, целостность проверяет только сама Prisma и только для операций через связи (например, `connect` на несуществующую запись даёт `P2025`). Полный справочник — раздел «Error reference» документации и наша справка.
 
 ### why
 Ошибка базы — не «исключение, которое надо проглотить», а нормальный исход: клиент вводит существующий телефон, кладовщик заводит дубль, менеджер открывает уже удалённую бронь. Слой данных обязан превращать их в понятные приложению ответы. Паттерн «ловить `PrismaClientKnownRequestError`, смотреть `code`, бросать свой класс» — основа обработки ошибок во всём остальном курсе.
 
 ### deep Если не получилось
-- **`e.meta?.target` пуст** — в Prisma 7 с адаптером поле `meta` может содержать другую структуру (**сверьтесь** по `console.log(e.meta)`): подстрой чтение под фактический вид.
+- **В сообщении пусто или «неизвестно» вместо имени ограничения** — структура `meta` другая: напечатай `console.log(JSON.stringify(e.meta))` и подстрой `constraintOf` под фактический вид (проверено на 7.10 с адаптером `pg`: `meta.driverAdapterError.cause.constraint.index`).
 - **`P2002` не срабатывает, дубль создан** — `unique` не применён миграцией: `npx prisma migrate status`.
 
 ### quiz

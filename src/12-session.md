@@ -42,14 +42,14 @@ await prisma.$disconnect()
 
 ```bash run
 cd ~/prisma-lab/rentkit
-SQL_LOG=1 npx tsx src/lessons/12-tx.ts 2>&1 | grep -E 'BEGIN|COMMIT|ROLLBACK|^\w' | head -16
+SQL_LOG=1 npx tsx src/lessons/12-tx.ts 2>&1 | grep -E 'COMMIT|ROLLBACK|^\w' | head -16
 ```
 
 ### result
 ```out auto
 ```
 
-В логе видны `BEGIN` … `COMMIT` у обеих транзакций и `ROLLBACK` у третьей. Разница видов:
+В логе видны `COMMIT` у обеих успешных транзакций и `ROLLBACK` у третьей (строк `BEGIN` в логе запросов нет — с адаптером `pg` их не печатают, как и в шаге 7.2). Разница видов:
 
 | | пакетная `$transaction([…])` | интерактивная `$transaction(async tx => …)` |
 |---|---|---|
@@ -423,7 +423,7 @@ cat /tmp/pool.log
 
 ### deep Если не получилось
 - **Упавших нет** — пул больше 10 или скрипт выполняется слишком быстро; увеличь число параллельных до 30 или сократи `maxWait`.
-- **Код ошибки не `P2028`** — формулировка и код могут отличаться; смотри `failed[0].reason` целиком (**сверьтесь**).
+- **Код ошибки не `P2028`** — смотри `failed[0].reason` целиком; на Prisma 7.10 у нас был `P2028` и текст «Transaction API error: Unable to start a transaction in the given time».
 
 ### quiz
 - Что означают `maxWait` и `timeout` у интерактивной транзакции?

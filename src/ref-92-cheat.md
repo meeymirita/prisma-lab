@@ -85,7 +85,7 @@ const prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString, max:
 
 | Код | Смысл |
 |---|---|
-| `P2002` | нарушено ограничение уникальности (`meta.target` — поля) |
+| `P2002` | нарушено ограничение уникальности (с адаптером `pg` имя ограничения — в `meta.driverAdapterError.cause.constraint`) |
 | `P2003` | нарушен внешний ключ |
 | `P2025` | запись не найдена (update/delete/connect) |
 | `P2028` | ошибка API транзакции (таймаут, закрыта) |
